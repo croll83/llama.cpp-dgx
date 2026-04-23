@@ -26,6 +26,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            break;
         case GGML_TYPE_TQ3_0:
             mul_mat_q_case<GGML_TYPE_TQ3_0>(ctx, args, stream);
             break;
@@ -293,13 +294,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
-    // TQ3_0/TQ3_1S/TQ3_4S: use MMQ for prefill (ne11 >= 64) on NVIDIA tensor-core GPUs.
-    // Contiguity guard in ggml_cuda_mul_mat ensures KV cache views use cuBLAS.
+    // TQ3_0/TQ3_1S/TQ3_4S: use MMQ for any multi-token batch (ne11 > 8) on NVIDIA tensor-core GPUs.
+    // Previously gated at >= 64 (prefill-only), but the dispatch cliff between
+    // MMVQ (<= 8) and cuBLAS dequant fallback (9..63) makes batch=9..63 an order
+    // of magnitude slower than MMQ. Lowering the threshold fixes spec-decode
+    // verify batches (DDtree ~16..32, tree_N ~23 typical).
+    // Contiguity guard in ggml_cuda_mul_mat ensures KV cache views still use cuBLAS.
     if ((type == GGML_TYPE_TQ3_0 || type == GGML_TYPE_TQ3_1S || type == GGML_TYPE_TQ3_4S) &&
         GGML_CUDA_CC_IS_NVIDIA(cc) &&
         fp16_mma_hardware_available(cc) &&
         n_experts == 0) {
-        return ne11 >= 64;
+        return ne11 > 8;
     }
 
     bool mmq_supported;
