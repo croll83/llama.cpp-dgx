@@ -283,6 +283,64 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+
+// === TQ3_0 optimized prefill: bulk dequant to fp16 + MMA attention ===
+__constant__ static const float d_tq3_0_centroids_prefill[8] = {
+    -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+     0.230106f,  0.725222f,  1.277503f,  1.988943f
+};
+
+static __global__ void k_tq3_0_dequant_f16(
+    const char * __restrict__ src, half * __restrict__ dst,
+    const int64_t ne0, const int64_t ne1, const int64_t ne2,
+    const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i3 = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0) return;
+    const char * src_row = src + i3*nb3 + i2*nb2 + i1*nb1;
+    const int64_t dst_idx = i3*ne2*ne1*ne0 + i2*ne1*ne0 + i1*ne0 + j;
+    const int ib = j / 32;
+    const int jj = j % 32;
+    const char * block_ptr = src_row + ib * 14;
+    const half * dp = (const half *)(block_ptr);
+    const uint8_t * qs = (const uint8_t *)(block_ptr + 2);
+    const float d = __half2float(*dp);
+    const int g = jj / 8;
+    const int r = jj % 8;
+    const uint8_t * qp = qs + g * 3;
+    const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
+    const int idx = (packed >> (3 * r)) & 7;
+    const float val = d_tq3_0_centroids_prefill[idx] * d;
+    dst[dst_idx] = __float2half(val);
+}
+
+static void ggml_cuda_tq3_0_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    const ggml_tensor * V = dst->src[2];
+    if (V->type != GGML_TYPE_TQ3_0) return;
+    const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
+    half * v_fp16 = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
+    dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
+    k_tq3_0_dequant_f16<<<grid_v, (int)V->ne[0], 0, stream>>>(
+        (const char *)V->data, v_fp16,
+        V->ne[0], V->ne[1], V->ne[2],
+        V->nb[1], V->nb[2], V->nb[3]);
+    ggml_tensor V_f16 = *V;
+    V_f16.type = GGML_TYPE_F16;
+    V_f16.data = v_fp16;
+    V_f16.nb[0] = sizeof(half);
+    V_f16.nb[1] = V->ne[0] * sizeof(half);
+    V_f16.nb[2] = V->ne[0] * V->ne[1] * sizeof(half);
+    V_f16.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+    ggml_tensor * orig_v = dst->src[2];
+    dst->src[2] = &V_f16;
+    ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+    dst->src[2] = orig_v;
+    CUDA_CHECK(cudaFreeAsync(v_fp16, stream));
+}
 // Context-adaptive V alpha: logarithmic scaling based on current KV occupancy.
 // 3-bit: alpha = 1.1484 - 0.01443 * ln(n_kv), calibrated on Qwen3.5-27B decode-time KLD sweeps
 //   at 8K/16K/32K. Optima: 8K→1.020, 16K→1.005, 32K→1.000.
@@ -1405,6 +1463,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+
+
+    // Optimized prefill path for tq3_0 V: bulk dequant to fp16 + MMA
+    if (V->type == GGML_TYPE_TQ3_0 && Q->ne[1] > 2) {
+        const int best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+        if (best == BEST_FATTN_KERNEL_MMA_F16) {
+            ggml_cuda_tq3_0_prefill_attend(ctx, dst);
+            return;
+        }
+    }
 
     // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
     // turbo4 K uses inverse FWHT during dequant — mixes centroids in float32 shmem before
