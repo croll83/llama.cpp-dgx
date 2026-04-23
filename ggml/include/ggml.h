@@ -428,13 +428,12 @@ extern "C" {
         GGML_TYPE_TQ3_4S  = 46, // TurboQuant 3-bit with four u8 per-8 scales (4.0 bpw)
         // internal-only types at high IDs to avoid upstream conflicts
         GGML_TYPE_TQ3_0      = 200, // KV-cache only
-        GGML_TYPE_COUNT      = 201,
-        GGML_TYPE_TURBO3_0 = 41, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO4_0 = 42, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
-        GGML_TYPE_TURBO3_TCQ = 44, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
-        GGML_TYPE_TURBO2_TCQ = 45, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
-        GGML_TYPE_COUNT   = 46,
+        GGML_TYPE_TURBO3_0 = 202, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO4_0 = 203, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO2_0 = 204, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
+        GGML_TYPE_TURBO3_TCQ = 205, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
+        GGML_TYPE_TURBO2_TCQ = 206, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
+        GGML_TYPE_COUNT   = 207,
     };
 
     // precision
