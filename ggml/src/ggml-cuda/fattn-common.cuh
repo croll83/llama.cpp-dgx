@@ -1033,6 +1033,7 @@ static __device__ __forceinline__ void dequantize_V_tq3_0(const void * __restric
         if constexpr (std::is_same_v<T, half>) { ((half *)  dst)[l] = __float2half(val); }
         else                                    { ((float *) dst)[l] = val; }
     }
+}
 
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo2_0(

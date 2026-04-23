@@ -413,6 +413,8 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = NULL,
         .vec_dot                  = ggml_vec_dot_tq3_4s_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_TURBO2_0] = {
         .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
         .vec_dot                  = NULL,
@@ -2101,9 +2103,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-        case GGML_OP_TURBO_WHT:
-            ggml_compute_forward_turbo_wht(params, tensor);
-            break;
             {
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
             }
@@ -2258,7 +2257,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
-        case GGML_OP_TURBO_WHT:
+
             {
                 n_tasks = n_threads;
             } break;
@@ -2457,6 +2456,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_TURBO_WHT:
+
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -2978,7 +2978,7 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = S_v * sizeof(float) * n_tasks;
                     } break;
-                case GGML_OP_TURBO_WHT:
+
                     {
                         cur = 0;  // no extra workspace needed
                     } break;

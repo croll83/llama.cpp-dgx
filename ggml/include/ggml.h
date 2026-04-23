@@ -577,7 +577,6 @@ extern "C" {
 
         GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
-        GGML_OP_TURBO_WHT,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
 
@@ -2642,12 +2641,6 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
-
-    // TurboQuant WHT rotation: out[i] = WHT(sign*in)[i] / sqrt(block_size)
-    // Applied to activations before TQ3_0 weight matmul to eliminate WHT from kernels
-    GGML_API struct ggml_tensor * ggml_turbo_wht(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf
