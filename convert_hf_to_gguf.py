@@ -494,7 +494,7 @@ class ModelBase:
                         s = self.model_tensors[name]
                         self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
                         tensors_to_remove.append(name)
-                    if name.endswith((".k_scale", ".v_scale")):
+                    if name.endswith((".k_scale", ".v_scale", ".pre_quant_scale")):
                         tensors_to_remove.append(name)
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
@@ -703,7 +703,7 @@ class ModelBase:
 
         # Remove any remaining unused auxiliary tensors
         for name in list(self.model_tensors.keys()):
-            if name.endswith((".k_scale", ".v_scale")):
+            if name.endswith((".k_scale", ".v_scale", ".pre_quant_scale")):
                 del self.model_tensors[name]
 
     def _flush_nvfp4_experts(self, key, expert_blocks, expert_scales, expert_input_scales, expert_shapes, bid, proj_type):
@@ -5363,7 +5363,7 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
 
-        if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name:
+        if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name and not name.endswith((".pre_quant_scale", ".input_scale", ".weight_scale", ".weight_scale_2")):
             head_k_dim = self.hparams["linear_key_head_dim"]
             head_v_dim = self.hparams["linear_value_head_dim"]
             num_v_per_k = num_v_heads // num_k_heads
