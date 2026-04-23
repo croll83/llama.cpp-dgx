@@ -26,6 +26,7 @@ add_library(${TARGET_LIB} STATIC
     kv_cache.cpp
     f16_convert.cu
     delta_net_chunked.cpp
+    session.cpp
 )
 
 target_include_directories(${TARGET_LIB}

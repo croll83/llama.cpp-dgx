@@ -1,9 +1,14 @@
-// dflash27b — standalone CUDA library for DFlash speculative decoding of
-// Qwen3.5-27B with the z-lab/Qwen3.5-27B-DFlash draft model on a single RTX 3090.
+// dflash27b — CUDA library for DFlash speculative decoding of Qwen3.5/3.6-27B
+// with the z-lab DFlash draft model.
 //
-// Model constants (hardcoded for this pair) + the last-error helper.
-// The real driver is test/test_dflash.cpp. A clean public API with chat /
-// streaming / KV persistence is a planned follow-up.
+// Public API: a `dflash_session_t` handle owns the target cache / draft
+// weights / step graph and exposes the three verbs needed by a host server:
+//
+//   create → prefill → decode_step ×N → prefill (append) → decode_step ...
+//
+// `prefill(..., kv_start)` allows APPEND-mode continuation when the caller
+// has already committed tokens 0..kv_start-1 in a previous call, enabling
+// prompt caching at the server layer.
 
 #ifndef DFLASH27B_H
 #define DFLASH27B_H
@@ -15,14 +20,14 @@
 extern "C" {
 #endif
 
-// ─── Model config ─────────────────────────────────────────────────
+// ─── Model config (compile-time constants for this target/draft pair) ─
 
 #define DFLASH27B_TARGET_HIDDEN        5120
 #define DFLASH27B_TARGET_LAYERS        64
 // NOTE: the `DFLASH27B_TARGET_N_*` / `_HEAD_DIM` macros below are DRAFT
 // dimensions (z-lab draft: 32 Q heads, 8 KV heads, 128 head_dim). The TARGET
 // Qwen3.5-27B qwen35 hybrid uses 24 Q heads, 4 KV heads, 256 head_dim, which
-// live in `src/internal.h` (n_embd_head_k/v, N_HEAD, N_HEAD_KV). Naming is
+// live in `internal.h` (n_embd_head_k/v, N_HEAD, N_HEAD_KV). Naming is
 // historical — do not change without updating safetensors_draft.cpp +
 // qwen3_dflash_graph.cpp which consume these as draft-side constants.
 #define DFLASH27B_TARGET_N_HEADS       32
@@ -38,13 +43,93 @@ extern "C" {
 #define DFLASH27B_DRAFT_N_TARGET_LAYERS 5  // fc projects 5*hidden -> hidden
 #define DFLASH27B_DRAFT_MASK_TOKEN_ID  248070
 
-// target_layer_ids = {1, 16, 31, 46, 61}  (0-indexed into target layers)
-// We capture the OUTPUT of each, which is HF hidden_states[lid + 1].
-
 // ─── Diagnostics ──────────────────────────────────────────────────
 
-// Most recent error from any loader / graph builder. Thread-safe.
+// Most recent error from any API call. Thread-safe.
 const char * dflash27b_last_error(void);
+
+// ─── Session API (public) ─────────────────────────────────────────
+
+// Opaque session handle. Owns the target cache, draft weights, step graph
+// and all per-request scratch. Not thread-safe: callers must serialize
+// access around a single session instance.
+typedef struct dflash_session_s dflash_session_t;
+
+typedef struct {
+    int   max_ctx;              // max tokens the target KV cache will hold
+    int   ddtree_budget;        // DDtree node budget (22 matches lucebox default)
+    int   ddtree;               // 1 = DDtree verify (tree), 0 = linear chain verify
+    int   fast_rollback;        // 1 = kernel-level SSM rollback for tree verify
+    int   ddtree_chain_seed;    // 1 = pre-seed full chain before best-first
+    float ddtree_temp;          // softmax temperature for top-K draft extraction
+    int   kv_tbq;               // 1 = align mask stride to 256 (TBQ FA kernels)
+    int   prefill_ubatch;       // 0 = auto (16 for <=2048 prompts, 192 otherwise)
+} dflash_session_params_t;
+
+// Sensible defaults matching lucebox test_dflash --fast-rollback --ddtree --ddtree-budget=22.
+dflash_session_params_t dflash_session_default_params(void);
+
+// Forward decl — the session creation takes a ggml CUDA backend handle that
+// lives in ggml-base.h. We forward-decl to keep this header minimal.
+struct ggml_backend;
+typedef struct ggml_backend * ggml_backend_t;
+
+// Create a session bound to the given target GGUF and draft safetensors
+// file. Returns NULL on error; use dflash27b_last_error() for details.
+dflash_session_t * dflash_session_create(const char * target_gguf,
+                                          const char * draft_safetensors,
+                                          const dflash_session_params_t * params,
+                                          ggml_backend_t backend);
+
+void dflash_session_destroy(dflash_session_t * s);
+
+// Reset the target cache + SSM / conv state + step graph. The next prefill
+// must use kv_start=0. Weights and draft stay resident.
+int dflash_session_reset(dflash_session_t * s);
+
+// Prefill `n_tokens` tokens starting at absolute KV position `kv_start`.
+//
+// kv_start must equal dflash_session_kv_end(s) — callers that want to
+// rewind must call dflash_session_reset() first (the SSM/conv state cannot
+// be rolled back to an arbitrary position without a snapshot).
+//
+// Returns 0 on success, -1 on error.
+int dflash_session_prefill(dflash_session_t * s,
+                            const int32_t * tokens, int n_tokens,
+                            int kv_start);
+
+// Emit the next committed token and optionally advance decode. This is a
+// token-granular step — the session internally runs one DDtree verify round
+// (or chain verify, per params) and commits up to `max_out` tokens. Returns
+// the number of tokens written to `out` (0..max_out). 0 means no progress
+// (hit internal limit).
+int dflash_session_decode_step(dflash_session_t * s,
+                                int32_t * out, int max_out);
+
+// Absolute KV position at end of the prefilled + decoded region.
+int dflash_session_kv_end(const dflash_session_t * s);
+
+// Last logits seed token (useful for picking up bonus after prefill).
+int32_t dflash_session_last_tok(const dflash_session_t * s);
+
+// Callback invoked for each committed token. Return non-zero to keep going,
+// zero to abort (server-side generation stop).
+typedef int (*dflash_token_cb)(int32_t token, void * user_data);
+
+// Runs one request end-to-end: optional reset + prefill + decode.
+//   prompt_ids / n_prompt  tokens to prefill (full prompt for RESET mode,
+//                          delta tokens for APPEND mode)
+//   n_gen                  max tokens to generate
+//   append_mode            0 = reset cache before prefill, 1 = continue
+//                          from dflash_session_kv_end() (prompt caching)
+//   cb / user_data         optional per-token callback
+// Returns number of committed tokens on success, -1 on error.
+int dflash_session_run(dflash_session_t * s,
+                       const int32_t * prompt_ids, int n_prompt,
+                       int n_gen,
+                       int append_mode,
+                       dflash_token_cb cb,
+                       void * user_data);
 
 #ifdef __cplusplus
 }
