@@ -3111,9 +3111,14 @@ private:
                cached_toks[lcp] == task_toks[lcp]) {
             lcp++;
         }
-        const bool can_append = (lcp == (int) cached_toks.size()) &&
-                                lcp > 0 &&
-                                lcp < n_prompt;
+        // can_append = cached is a PREFIX of new prompt. That covers both:
+        //   * identical prompt (lcp == cached.size() == n_prompt): delta=0,
+        //     daemon skips prefill and goes straight to decode.
+        //   * strict extension (lcp == cached.size() < n_prompt): delta has
+        //     only the new tokens.
+        // We still fall back to RESET when cache has tokens beyond LCP
+        // (rewind would require an SSM state snapshot we don't keep).
+        const bool can_append = (lcp == (int) cached_toks.size()) && lcp > 0;
         const int append_mode = can_append ? 1 : 0;
         const int prefill_off = append_mode ? lcp : 0;
 
