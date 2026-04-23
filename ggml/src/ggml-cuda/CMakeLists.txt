@@ -204,6 +204,12 @@ if (CUDAToolkit_FOUND)
 
     set(CUDA_FLAGS -use_fast_math -extended-lambda)
 
+    # CMake does not auto-set -DNDEBUG for CUDA Release builds (only C/C++/ASM).
+    # Without this, CUDA assert() calls stay live in Release — perf cost and
+    # spurious failures on platforms where debug-only invariants differ
+    # (e.g. integrated UMA GPUs where kernel outputs can live in cuda_host).
+    list(APPEND CUDA_FLAGS $<$<NOT:$<CONFIG:Debug>>:-DNDEBUG>)
+
     if (GGML_CUDA_DEBUG)
         list(APPEND CUDA_FLAGS -lineinfo)
         add_compile_definitions(GGML_CUDA_DEBUG)

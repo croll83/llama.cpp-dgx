@@ -317,7 +317,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += prop.totalGlobalMem;
-        info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+        // Detect UMA / integrated GPU (e.g. DGX Spark GB10, Jetson, APU).
+        // Can be forced with GGML_CUDA_ENABLE_UNIFIED_MEMORY or disabled with GGML_CUDA_DISABLE_UNIFIED_MEMORY
+        // (upstream hardcoded this to false due to #15034; re-enabled here for UMA platforms — integrated kernels
+        // write correctly to cuda_host buffers and the CUDA graph path now handles this).
+        info.devices[id].integrated = (prop.integrated > 0 && getenv("GGML_CUDA_DISABLE_UNIFIED_MEMORY") == nullptr)
+            || (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr);
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -3157,11 +3162,32 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+            const ggml_type  type     = node->src[0]->type;
+            const int64_t    ne2      = node->ne[2];
+            const int64_t    n_experts = node->src[0]->ne[2];
+            const int64_t    ne12     = node->src[1]->ne[2];
+            // Mirror the fast-path dispatch in ggml_cuda_mul_mat_id.
+            // Only disable CUDA graphs when the slow, stream-synchronizing
+            // fallback would actually run.
+            bool uses_fast_path = false;
+            if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+                if (ggml_is_quantized(type)) {
+                    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(type, cc);
+                    if (ne2 <= mmvq_mmid_max) {
+                        uses_fast_path = true; // MMVQ
+                    }
+                } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    uses_fast_path = true; // MMVF (AMD only)
+                }
+            }
+            if (!uses_fast_path && ggml_cuda_should_use_mmq(type, cc, ne12, n_experts)) {
+                uses_fast_path = true; // MMQ
+            }
+            if (!uses_fast_path && ggml_cuda_should_use_mmf(type, cc, WARP_SIZE,
+                    node->src[0]->ne, node->src[0]->nb, ne12, /*mul_mat_id=*/true)) {
+                uses_fast_path = true; // MMF
+            }
+            if (!uses_fast_path) {
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
@@ -4159,7 +4185,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 #ifndef NDEBUG
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
+                // On integrated GPUs (UMA), op outputs can legitimately live in
+                // cuda_host (pinned) memory — the kernel writes to it directly.
+                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
