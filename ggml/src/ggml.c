@@ -6337,6 +6337,8 @@ struct ggml_tensor * ggml_gated_delta_net_tree_persist(
     GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
 
     result->src[7] = persist_inter;
+    return result;
+}
 // ggml_turbo_wht
 
 struct ggml_tensor * ggml_turbo_wht(
