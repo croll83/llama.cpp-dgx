@@ -3082,6 +3082,20 @@ private:
     }
 
     void process_slot_dflash(server_slot & slot) {
+        // Reset per-request slot state. The normal llama-server prompt-eval
+        // path does this piecemeal (n_decoded reset at line ~2678, text
+        // clears inside reset()); here we need to mirror those so counters
+        // don't leak across requests.
+        slot.generated_text.clear();
+        slot.generated_tokens.clear();
+        slot.generated_token_probs.clear();
+        slot.n_sent_text            = 0;
+        slot.n_decoded              = 0;
+        slot.has_new_line           = false;
+        slot.truncated              = false;
+        slot.stop                   = STOP_TYPE_NONE;
+        slot.stopping_word.clear();
+
         slot.state                  = SLOT_STATE_PROCESSING_PROMPT;
         slot.t_start_process_prompt = ggml_time_us();
         slot.t_start_generation     = 0;
