@@ -22,8 +22,17 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
+target_include_directories(${TARGET} PRIVATE ../)  # so server-context.cpp can include "dflash-cli/dflash27b.h"
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+# DFlash MTP integration: link the dflash27b static library when CUDA is on
+# (the target is defined in tools/dflash-cli). Otherwise Phase C integration
+# is inactive and --dflash will error out at startup.
+if (TARGET dflash27b)
+    target_link_libraries(${TARGET} PUBLIC dflash27b)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SERVER_HAS_DFLASH=1)
+endif()
 
 
 # llama-server executable

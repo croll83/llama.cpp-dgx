@@ -844,15 +844,17 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     // --seq-verify path dropped in Phase C; pin to false.
     const bool seq_verify        = false;
 
+    // stream_emit is the hook the original CLI used to drip tokens to
+    // --stream-fd. We reuse its call sites inside the decode loop to drive
+    // the session callback, so every committed token arrives here first.
+    bool cb_want_stop = false;
     auto stream_emit = [&](int32_t tok) {
-        // No-op at the library level — the caller drives streaming via cb.
+        if (!cb || cb_want_stop) return;
+        if (cb(tok, user_data) == 0) cb_want_stop = true;
     };
-
-    // Call the callback for each committed token; return value interpreted
-    // as "keep going" when non-zero.
     auto emit_and_continue = [&](int32_t tok) -> bool {
-        if (!cb) return true;
-        return cb(tok, user_data) != 0;
+        stream_emit(tok);
+        return !cb_want_stop;
     };
 
     std::vector<int32_t> prompt(prompt_ids, prompt_ids + n_prompt);

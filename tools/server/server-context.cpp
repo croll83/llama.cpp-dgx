@@ -12,6 +12,11 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// DFlash MTP backend (Phase C): integrated directly into the server slot
+// loop when --dflash is set on the CLI. Headers live next door in dflash-cli/.
+#include "dflash-cli/dflash27b.h"
+#include "ggml-cuda.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -563,6 +568,11 @@ private:
 
     llama_model_ptr model_dft;
 
+    // DFlash session: owns target cache + draft weights + step graph.
+    // Created in load_model() when params_base.dflash is true.
+    // Shared across slots — current dflash MVP serializes requests.
+    dflash_session_t * dflash_session = nullptr;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -589,6 +599,10 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        if (dflash_session) {
+            dflash_session_destroy(dflash_session);
+            dflash_session = nullptr;
+        }
         llama_init.reset();
         ctx = nullptr;
         model = nullptr;
@@ -657,6 +671,44 @@ private:
         n_ctx = llama_n_ctx(ctx);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        // ── DFlash init ──
+        if (params_base.dflash) {
+            if (params_base.dflash_draft.empty()) {
+                SRV_ERR("%s", "--dflash requires --dflash-draft <safetensors>\n");
+                return false;
+            }
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("%s", "--dflash currently requires -np 1 (single slot)\n");
+                return false;
+            }
+            ggml_backend_t be = ggml_backend_cuda_init(0);
+            if (!be) {
+                SRV_ERR("%s", "DFlash: ggml_backend_cuda_init failed\n");
+                return false;
+            }
+            dflash_session_params_t dp = dflash_session_default_params();
+            dp.max_ctx           = params_base.dflash_max_ctx > 0
+                                       ? params_base.dflash_max_ctx
+                                       : (int) params_base.n_ctx;
+            dp.ddtree_budget     = params_base.dflash_budget;
+            dp.ddtree            = 1;
+            dp.fast_rollback     = 1;
+            dp.ddtree_chain_seed = 1;
+            dp.ddtree_temp       = 1.0f;
+            dp.kv_tbq            = 0;
+            dp.prefill_ubatch    = 0;
+            dflash_session = dflash_session_create(
+                params_base.model.path.c_str(),
+                params_base.dflash_draft.c_str(),
+                &dp, be);
+            if (!dflash_session) {
+                SRV_ERR("DFlash: session_create failed: %s\n", dflash27b_last_error());
+                return false;
+            }
+            SRV_INF("DFlash session ready (budget=%d, max_ctx=%d)\n", dp.ddtree_budget, dp.max_ctx);
+        }
+
 
         if (params_base.speculative.has_dft()) {
             SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
@@ -1225,6 +1277,19 @@ private:
         return true;
     }
 
+    // ── DFlash slot dispatcher (Phase C) ────────────────────────────
+    //
+    // When --dflash is set, the server slot decode path is replaced with a
+    // direct call into the dflash27b session library. Prompt caching is
+    // driven by the slot's usual slot.prompt.tokens / LCP machinery; a
+    // prefix match lets us call dflash_session_run with append=1 and only
+    // the delta, avoiding the full target-cache rebuild per turn.
+    //
+    // MVP constraints:
+    //   * n_parallel == 1 (single slot). Checked at load_model.
+    //   * Greedy decoding only (sampler is bypassed). Temperature / top_p /
+    //     grammar are ignored. This matches test_dflash's verify path.
+    //   * No mtmd / multimodal in the same slot.
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
@@ -1988,6 +2053,7 @@ private:
     }
 
     void update_slots() {
+        if (dflash_session) { update_slots_dflash(); return; }
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2973,6 +3039,116 @@ private:
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
+
+    // ──────────────── DFlash slot dispatcher ─────────────────────
+    //
+    // Implementations of the two methods declared near process_token.
+    // Kept inline-in-class so they see all the private state (slots, ctx,
+    // vocab, prompt_cache, metrics, ...) without extra plumbing.
+
+    struct dflash_cb_ctx {
+        server_context_impl * impl;
+        server_slot         * slot;
+        std::vector<llama_token> generated; // track for slot.prompt.tokens update
+        bool stop = false;
+    };
+
+    static int dflash_on_token_thunk(int32_t tok, void * user) {
+        auto * c = (dflash_cb_ctx *) user;
+        if (c->stop) return 0;
+
+        completion_token_output out{};
+        out.tok  = (llama_token) tok;
+        out.prob = 1.0f;
+        out.text_to_send = common_token_to_piece(c->impl->ctx, out.tok, /*special=*/ false);
+
+        c->generated.push_back(out.tok);
+        c->slot->n_decoded++;
+
+        bool keep_going = c->impl->process_token(out, *c->slot);
+        if (!keep_going) c->stop = true;
+        return keep_going ? 1 : 0;
+    }
+
+    void update_slots_dflash() {
+        // Single-slot MVP: iterate, pick up anything STARTED, run synchronously.
+        // Non-STARTED slots are either idle or already done (we transition all
+        // the way to RELEASED within process_slot_dflash).
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_STARTED) {
+                process_slot_dflash(slot);
+            }
+        }
+    }
+
+    void process_slot_dflash(server_slot & slot) {
+        slot.state                  = SLOT_STATE_PROCESSING_PROMPT;
+        slot.t_start_process_prompt = ggml_time_us();
+        slot.t_start_generation     = 0;
+
+        const llama_tokens & task_toks   = slot.task->tokens.get_text_tokens();
+        const llama_tokens & cached_toks = slot.prompt.tokens.get_text_tokens();
+        const int            n_prompt    = (int) task_toks.size();
+
+        // Longest common prefix against the target's current KV contents.
+        int lcp = 0;
+        while (lcp < (int) cached_toks.size() &&
+               lcp < n_prompt &&
+               cached_toks[lcp] == task_toks[lcp]) {
+            lcp++;
+        }
+        const bool can_append = (lcp == (int) cached_toks.size()) &&
+                                lcp > 0 &&
+                                lcp < n_prompt;
+        const int append_mode = can_append ? 1 : 0;
+        const int prefill_off = append_mode ? lcp : 0;
+
+        std::vector<int32_t> delta_ids;
+        delta_ids.reserve(n_prompt - prefill_off);
+        for (int i = prefill_off; i < n_prompt; i++) {
+            delta_ids.push_back((int32_t) task_toks[i]);
+        }
+
+        int n_gen = slot.task->params.n_predict;
+        if (n_gen <= 0) n_gen = std::max(1, slot.n_ctx - n_prompt - 32);
+
+        slot.n_prompt_tokens_cache     = append_mode ? lcp : 0;
+        slot.n_prompt_tokens_processed = (int) delta_ids.size();
+        slot.state              = SLOT_STATE_GENERATING;
+        slot.t_start_generation = ggml_time_us();
+
+        dflash_cb_ctx cc{};
+        cc.impl = this;
+        cc.slot = &slot;
+
+        SRV_INF("DFlash run: slot=%d prompt=%d lcp=%d append=%d n_gen=%d\n", slot.id, n_prompt, lcp, append_mode, n_gen);
+
+        int n_out = dflash_session_run(
+            dflash_session,
+            delta_ids.empty() ? nullptr : delta_ids.data(),
+            (int) delta_ids.size(),
+            n_gen, append_mode,
+            &server_context_impl::dflash_on_token_thunk, &cc);
+
+        if (n_out < 0) {
+            send_error(slot, std::string("DFlash session_run failed: ") + dflash27b_last_error(),
+                       ERROR_TYPE_SERVER);
+            slot.release();
+            return;
+        }
+
+        // Refresh slot.prompt.tokens so the NEXT task's LCP match will find
+        // the full prompt + generated prefix in the cache and fire append mode.
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(task_toks);
+        if (!cc.generated.empty()) {
+            slot.prompt.tokens.insert(cc.generated);
+        }
+
+        send_final_response(slot);
+        slot.release();
+    }
+
 };
 
 //

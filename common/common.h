@@ -462,6 +462,14 @@ struct common_params {
     struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
+    // DFlash MTP speculative decoding (z-lab / Luce-Org DFlash).
+    // Enabled with --dflash. The target model is the main --model; the draft
+    // is a safetensors file (not a GGUF) loaded by the dflash27b library.
+    bool        dflash             = false;
+    std::string dflash_draft;                 // path to draft safetensors
+    int         dflash_budget      = 22;      // DDtree node budget
+    int         dflash_max_ctx     = 0;       // 0 = use common_params.n_ctx
+
     struct common_params_model model;
 
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT

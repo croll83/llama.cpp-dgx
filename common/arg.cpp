@@ -2332,6 +2332,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_CPU_MOE_DRAFT"));
+
+    // ───────────────── DFlash MTP (z-lab / Luce-Org) ─────────────────
+    add_opt(common_arg(
+        {"--dflash"},
+        "enable DFlash MTP speculative decoding (requires --dflash-draft)",
+        [](common_params & params) {
+            params.dflash = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH"));
+    add_opt(common_arg(
+        {"--dflash-draft"}, "FILE",
+        "path to the DFlash draft model safetensors (required with --dflash)",
+        [](common_params & params, const std::string & value) {
+            params.dflash_draft = value;
+            params.dflash = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_DRAFT"));
+    add_opt(common_arg(
+        {"--dflash-budget"}, "N",
+        "DDtree node budget for DFlash verify (default: 22)",
+        [](common_params & params, int value) {
+            params.dflash_budget = value > 0 ? value : 22;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_BUDGET"));
+    add_opt(common_arg(
+        {"--dflash-max-ctx"}, "N",
+        "max context for DFlash target cache (default: --ctx-size value)",
+        [](common_params & params, int value) {
+            params.dflash_max_ctx = value > 0 ? value : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_MAX_CTX"));
+
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
