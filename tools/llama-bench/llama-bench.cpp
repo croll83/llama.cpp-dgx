@@ -260,8 +260,6 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "layer";
         case LLAMA_SPLIT_MODE_ROW:
             return "row";
-        case LLAMA_SPLIT_MODE_TENSOR:
-            return "tensor";
         default:
             GGML_ABORT("invalid split mode");
     }
@@ -446,7 +444,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|row>          (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>                     (default: %s)\n", join(cmd_params_defaults.flash_attn, ",").c_str());
@@ -491,8 +489,20 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
-    if (s == "tq3_0") {
-        return GGML_TYPE_TQ3_0;
+    if (s == "turbo2") {
+        return GGML_TYPE_TURBO2_0;
+    }
+    if (s == "turbo3") {
+        return GGML_TYPE_TURBO3_0;
+    }
+    if (s == "turbo4") {
+        return GGML_TYPE_TURBO4_0;
+    }
+    if (s == "turbo3_tcq") {
+        return GGML_TYPE_TURBO3_TCQ;
+    }
+    if (s == "turbo2_tcq") {
+        return GGML_TYPE_TURBO2_TCQ;
     }
 
     return GGML_TYPE_COUNT;
@@ -748,8 +758,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_LAYER;
                     } else if (m == "row") {
                         mode = LLAMA_SPLIT_MODE_ROW;
-                    } else if (m == "tensor") {
-                        mode = LLAMA_SPLIT_MODE_TENSOR;
                     } else {
                         invalid_param = true;
                         break;
@@ -1017,9 +1025,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 model.hf_file = params.hf_file[i];
             }
 
-            common_download_opts opts;
-            opts.bearer_token = params.hf_token;
-            auto download_result = common_download_model(model, opts);
+            auto download_result = common_download_model(model, params.hf_token);
             if (download_result.model_path.empty()) {
                 fprintf(stderr, "error: failed to download model from HuggingFace\n");
                 exit(1);
@@ -1777,7 +1783,7 @@ struct markdown_printer : public printer {
             return 6;
         }
         if (field == "split_mode") {
-            return 6;
+            return 5;
         }
         if (field == "flash_attn") {
             return 2;

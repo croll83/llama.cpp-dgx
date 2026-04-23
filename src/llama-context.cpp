@@ -1,6 +1,5 @@
 #include "llama-context.h"
 
-#include "ggml.h"
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -9,7 +8,6 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
-#include "llama.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -219,10 +217,10 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+        for (auto * dev : model.devices) {
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
             }
             backends.emplace_back(backend);
         }
@@ -297,8 +295,8 @@ llama_context::llama_context(
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                const auto & dev = model.devices[0];
-                auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
+                auto * dev = model.devices[0];
+                auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
                 if (host_buft) {
                     buft = host_buft;
                 }
@@ -344,6 +342,23 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        // turbo3/turbo4 KV cache stores data in FWHT-rotated space.
+        // Q pre-rotation and V inverse rotation are only implemented in the Flash Attention path.
+        // Without FA, attention computes dot(Q_unrotated, K_rotated) = garbage.
+        // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
+        // and builds the graph plan with FA ops on GPU from the start.
+        {
+            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
+            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
+            if (turbo_k || turbo_v) {
+                if (!cparams.flash_attn) {
+                    LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
+                    cparams.flash_attn = true;
+                }
+                cparams.auto_fa = false;  // turbo requires FA — don't let sched_reserve override
+            }
         }
 
         sched_reserve();
@@ -446,15 +461,6 @@ void llama_context::sched_reserve() {
             const int il = std::stoi(n->name + prefix_len);
             ggml_backend_dev_t device_kv = model.dev_layer(il);
             if (device_fa != device_kv) {
-                const bool tq3_k_f16_v_fastpath =
-                    n->src[1] != nullptr && n->src[2] != nullptr &&
-                    n->src[1]->type == GGML_TYPE_TQ3_0 &&
-                    n->src[2]->type == GGML_TYPE_F16;
-                if (tq3_k_f16_v_fastpath) {
-                    LLAMA_LOG_INFO("%s: layer %d keeps Flash Attention enabled for TQ3_0 K + F16 V fast path\n",
-                            __func__, il);
-                    continue;
-                }
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the Flash Attention tensor "
                         "is assigned to device %s (usually due to missing support)\n",
                         __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_fa));
@@ -1031,11 +1037,9 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 
     for (auto & backend : backends) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
-        if (reg) {
-            auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
-            if (set_abort_callback_fn) {
-                set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
-            }
+        auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
+        if (set_abort_callback_fn) {
+            set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
         }
     }
 }
@@ -2955,21 +2959,6 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-        if (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v)) {
-            LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented\n", __func__);
-            return nullptr;
-        }
-    }
-
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
@@ -2989,6 +2978,16 @@ llama_context * llama_init_from_model(
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
+        }
+    }
+
+    // Auto-enable flash attention for turbo KV cache types
+    {
+        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
+        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
+        if ((turbo_k || turbo_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_WARN("%s: turbo KV cache requires flash attention — enabling automatically\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }
     }
 
@@ -3503,7 +3502,7 @@ void llama_perf_context_reset(llama_context * ctx) {
 }
 
 void llama_memory_breakdown_print(const struct llama_context * ctx) {
-    const auto & devices = ctx->get_model().devices;
+    const std::vector<ggml_backend_dev_t> & devices = ctx->get_model().devices;
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown = ctx->memory_breakdown();
 
@@ -3539,7 +3538,7 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
         if (dev) {
             int i_dev = -1;
             for (size_t i = 0; i < devices.size(); i++) {
-                if (devices[i].dev == dev) {
+                if (devices[i] == dev) {
                     i_dev = i;
                     break;
                 }
@@ -3556,7 +3555,7 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
 
     // print memory breakdown for each device:
     for (size_t i = 0; i < devices.size(); i++) {
-        ggml_backend_dev_t          dev = devices[i].dev;
+        ggml_backend_dev_t          dev = devices[i];
         llama_memory_breakdown_data mb  = mb_dev[i];
 
         const std::string name = ggml_backend_dev_name(dev);

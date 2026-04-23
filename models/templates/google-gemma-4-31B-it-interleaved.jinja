@@ -152,14 +152,22 @@
 
 {%- set ns = namespace(prev_message_type=None, last_user_message=-1) -%}
 {%- set loop_messages = messages -%}
+<<<<<<< HEAD
 {{- bos_token -}}
+=======
+{{ bos_token }}
+>>>>>>> spiritbuun/master
 {#- Handle System/Tool Definitions Block -#}
 {%- if (enable_thinking is defined and enable_thinking) or tools or messages[0]['role'] in ['system', 'developer'] -%}
     {{- '<|turn>system\n' -}}
 
     {#- Inject Thinking token at the very top of the FIRST system turn -#}
     {%- if enable_thinking is defined and enable_thinking -%}
+<<<<<<< HEAD
         {{- '<|think|>\n' -}}
+=======
+        {{- '<|think|>' -}}
+>>>>>>> spiritbuun/master
         {%- set ns.prev_message_type = 'think' -%}
     {%- endif -%}
 
@@ -255,13 +263,21 @@
                             {{- item['text'] | trim -}}
                         {%- endif -%}
                     {%- elif item['type'] == 'image' -%}
+<<<<<<< HEAD
                         {{- '<|image|>' -}}
+=======
+                        {{- '\n\n<|image|>\n\n' -}}
+>>>>>>> spiritbuun/master
                         {%- set ns.prev_message_type = 'image' -%}
                     {%- elif item['type'] == 'audio' -%}
                         {{- '<|audio|>' -}}
                         {%- set ns.prev_message_type = 'audio' -%}
                     {%- elif item['type'] == 'video' -%}
+<<<<<<< HEAD
                         {{- '<|video|>' -}}
+=======
+                        {{- '\n\n<|video|>\n\n' -}}
+>>>>>>> spiritbuun/master
                         {%- set ns.prev_message_type = 'video' -%}
                     {%- endif -%}
                 {%- endfor -%}
