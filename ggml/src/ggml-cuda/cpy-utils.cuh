@@ -255,6 +255,14 @@ static __device__ void quantize_f32_tq3_0_block(const float * __restrict__ x, bl
     }
 }
 
+// Wire quantize_f32_tq3_0_block as a CPY block-quantizer so ggml_cpy can
+// directly materialize an F32 source into a TurboQuant TQ3_0 destination.
+// Enables DFlash's explicit Q/K/V → KV copy to allocate the target KV
+// cache as TQ3_0 instead of Q8_0 (2.7× smaller).
+static __device__ void cpy_blck_f32_tq3_0(const char * cxi, char * cdsti) {
+    quantize_f32_tq3_0_block((const float *)cxi, (block_tq3_0 *)cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

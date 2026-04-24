@@ -114,11 +114,7 @@ bool create_target_cache(const TargetWeights & w,
     // Env overrides (checked in order; last wins):
     //   DFLASH27B_KV_F16=1  → f16 (regression baseline)
     //   DFLASH27B_KV_Q4=1   → Q4_0 (8× vs f16, required for 128K on 24 GB, ~3% AL hit)
-    //
-    // Note: TurboQuant KV types (TURBO2/3/4_0, TURBO*_TCQ, TQ3_0) are defined
-    // and usable by fattn, but llama-cpp-v5 ggml-cuda/cpy.cu currently lacks
-    // F32→TURBO*/TQ3_0 CPY kernels. Dflash's explicit Q/K/V→KV copy path aborts
-    // with those types. Adding those CPY kernels is future work tracked upstream.
+    //   DFLASH27B_KV_TQ3=1  → TQ3_0 (TurboQuant, 2.7× smaller than Q8_0)
     //
     // Default: Q8_0 — best quality/memory tradeoff at short context.
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
@@ -129,6 +125,22 @@ bool create_target_cache(const TargetWeights & w,
     if (const char * s = std::getenv("DFLASH27B_KV_Q4")) {
         if (std::atoi(s) != 0) { kv_k_type = GGML_TYPE_Q4_0; kv_v_type = GGML_TYPE_Q4_0; }
     }
+    // TQ3_0 requires the F32→TQ3_0 CPY kernel (wired in ggml-cuda/cpy.cu)
+    // and fattn support (already there, see fattn-common.cuh).
+    if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
+        if (std::atoi(s) != 0) { kv_k_type = GGML_TYPE_TQ3_0; kv_v_type = GGML_TYPE_TQ3_0; }
+    }
+    // Independent K / V override so callers can mix, e.g. K=Q8_0 V=TQ3_0.
+    auto parse_type = [](const char * s) -> ggml_type {
+        if (!s) return GGML_TYPE_COUNT;
+        if (std::strcmp(s, "f16")   == 0) return GGML_TYPE_F16;
+        if (std::strcmp(s, "q8_0")  == 0) return GGML_TYPE_Q8_0;
+        if (std::strcmp(s, "q4_0")  == 0) return GGML_TYPE_Q4_0;
+        if (std::strcmp(s, "tq3_0") == 0) return GGML_TYPE_TQ3_0;
+        return GGML_TYPE_COUNT;
+    };
+    if (ggml_type t = parse_type(std::getenv("DFLASH27B_KV_K")); t != GGML_TYPE_COUNT) kv_k_type = t;
+    if (ggml_type t = parse_type(std::getenv("DFLASH27B_KV_V")); t != GGML_TYPE_COUNT) kv_v_type = t;
     int fa_idx = 0, dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
