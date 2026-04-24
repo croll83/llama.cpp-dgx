@@ -876,6 +876,25 @@ extern "C" void dflash_session_get_last_stats(const dflash_session_t * s,
     *out = s->last_stats;
 }
 
+extern "C" int dflash_session_anchor_pos(const dflash_session_t * s) {
+    return s ? s->cache.anchor_pos : 0;
+}
+
+extern "C" int dflash_session_rewind_to_anchor(dflash_session_t * s) {
+    if (!s) return -1;
+    if (s->cache.anchor_pos <= 0) return 0;  // nothing to do
+
+    // Restore SSM + conv state from the anchor. KV / target_feat live as
+    // per-position slots — we don't need to clear them because the next
+    // prefill-from-anchor will overwrite the positions in [anchor_pos..new_end].
+    restore_anchor_state(s->cache);
+    s->cache.cur_pos = s->cache.anchor_pos;
+    s->kv_end        = s->cache.anchor_pos;
+    // last_tok stays whatever it was; the caller will overwrite it by
+    // feeding the delta tokens and reading the new last-row logits.
+    return 0;
+}
+
 // Runs one request end-to-end: (optional reset) + prefill + decode loop.
 // Returns number of tokens emitted via the callback (0..n_gen), or -1 on error.
 extern "C" int dflash_session_run(dflash_session_t * s,
@@ -936,16 +955,25 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         // prompt bytes already in 
         std::printf("[prompt] %zu tokens\n", prompt.size());
 
-        if ((int)prompt.size() + n_gen + q_len > max_ctx) {
-            std::fprintf(stderr, "prompt (%zu) + gen (%d) + block (%d) = %d exceeds max_ctx (%d)\n",
-                         prompt.size(), n_gen, q_len, (int)prompt.size() + n_gen + q_len, max_ctx);
+        if (prefill_kv_offset + (int)prompt.size() + n_gen + q_len > max_ctx) {
+            std::fprintf(stderr,
+                "prefill_off (%d) + prompt (%zu) + gen (%d) + block (%d) = %d exceeds max_ctx (%d)\n",
+                prefill_kv_offset, prompt.size(), n_gen, q_len,
+                prefill_kv_offset + (int)prompt.size() + n_gen + q_len, max_ctx);
             return -1;
         }
 
         std::vector<float>   embed_buf(hidden);
         std::vector<int32_t> out_all = prompt;
-        int committed = 0;
-        int32_t last_tok = -1;
+        // `committed` tracks the absolute KV position across prefill +
+        // decode. In append mode the session already has
+        // [0..prefill_kv_offset] cached so we start counting from there.
+        int committed = prefill_kv_offset;
+        // Seed last_tok for the decode loop. If prefill actually runs it
+        // overwrites this with argmax of the last-row logits; if the
+        // caller passed 0 delta tokens (pure append-and-continue) we
+        // fall back to whatever the previous run stored.
+        int32_t last_tok = append_mode ? s->last_tok : -1;
 
     // ── Prefill: batched decode over prompt. Chunks of up to PREFILL_UBATCH
     // tokens are pushed through a single forward pass with a causal mask,
@@ -974,18 +1002,33 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     std::vector<int32_t>  pf_pos_buf;
     std::vector<float>    pf_logits_buf;
     const int prompt_len = (int)prompt.size();
+
+    // Anchor checkpoint heuristic: take the long-lived SSM/conv snapshot a
+    // bit BEFORE the end of prefill so chat-template re-tokenization on a
+    // follow-up call (which typically diverges inside the last ~20 tokens,
+    // i.e. the assistant-start header) has a rewind target earlier than
+    // the divergence. For prefills shorter than the offset we fall back
+    // to snapshotting post-prefill (see below).
+    constexpr int ANCHOR_REWIND_BACKOFF = 32;
+    const int anchor_target_pos = prefill_kv_offset +
+        std::max(0, prompt_len - ANCHOR_REWIND_BACKOFF);
+    // Only re-snapshot when the new target is beyond any existing anchor
+    // — otherwise keep the older one so cross-run rewinds stay useful.
+    bool anchor_taken_this_prefill = false;
+
     for (int start = 0; start < prompt_len; start += PREFILL_UBATCH) {
-        const int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
-        const int kv_len   = start + n_tokens;
+        const int n_tokens  = std::min(PREFILL_UBATCH, prompt_len - start);
+        const int abs_start = prefill_kv_offset + start;
+        const int kv_len    = abs_start + n_tokens;
 
         // TBQ FA requires kv_len aligned to 256, which means we always need
         // a mask (padding positions must be -inf). For f16/Q-KV the existing
         // n_tokens>1 heuristic stays valid.
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
-                                /*kv_start=*/start, /*n_tokens=*/n_tokens,
+                                /*kv_start=*/abs_start, /*n_tokens=*/n_tokens,
                                 /*with_mask=*/pf_with_mask, /*capture=*/true)) {
-            std::fprintf(stderr, "prefill build @%d\n", start); return 1;
+            std::fprintf(stderr, "prefill build @%d\n", abs_start); return 1;
         }
 
         pf_embed_buf.assign((size_t)hidden * n_tokens, 0.0f);
@@ -998,7 +1041,7 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         // positions, axis 3 is 0 for plain text.
         pf_pos_buf.assign((size_t)4 * n_tokens, 0);
         for (int i = 0; i < n_tokens; i++) {
-            const int p = start + i;
+            const int p = abs_start + i;
             pf_pos_buf[0 * n_tokens + i] = p;
             pf_pos_buf[1 * n_tokens + i] = p;
             pf_pos_buf[2 * n_tokens + i] = p;
@@ -1011,13 +1054,13 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         // is active (which pads kv_len to 256 and needs -inf on the padding
         // positions even for a single query).
         if (pf_with_mask) {
-            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/start);
+            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/abs_start);
             ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
                                     sizeof(uint16_t) * pf_mask_buf.size());
         }
 
         auto st = ggml_backend_graph_compute(backend, sg.gf);
-        if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill compute @%d\n", start); return 1; }
+        if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill compute @%d\n", abs_start); return 1; }
 
         // Only need the last position's logits to seed decode.
         pf_logits_buf.assign(vocab, 0.0f);
@@ -1025,13 +1068,32 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), last_row_off,
                                 sizeof(float) * vocab);
         last_tok = argmax_f32(pf_logits_buf.data(), vocab);
-        committed = start + n_tokens;
+        committed = abs_start + n_tokens;
+
+        // Anchor checkpoint: take the long-lived SSM/conv snapshot as
+        // soon as we cross anchor_target_pos. Doing it mid-prefill (rather
+        // than post-prefill) means the anchor sits BEFORE the typical
+        // chat-template divergence point at the tail of the prompt.
+        if (!anchor_taken_this_prefill && committed >= anchor_target_pos) {
+            snapshot_anchor_state(cache);
+            cache.anchor_pos = committed;
+            anchor_taken_this_prefill = true;
+        }
     }
     auto t_pf1 = std::chrono::steady_clock::now();
     std::printf("[prefill] %d tokens in %.2f s, last_tok=%d\n",
                 committed,
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
                 last_tok);
+
+    // Fallback anchor: if the prefill loop didn't take one (e.g. the
+    // caller passed 0 delta tokens in append mode, or the backoff-adjusted
+    // target landed exactly at position 0) snap the current state so the
+    // next call has at least something to rewind to.
+    if (!anchor_taken_this_prefill && committed > 0) {
+        snapshot_anchor_state(cache);
+        cache.anchor_pos = committed;
+    }
 
     // ── DFlash decode loop
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;

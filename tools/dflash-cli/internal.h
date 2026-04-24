@@ -201,6 +201,16 @@ struct TargetCache {
     std::vector<ggml_tensor *> ssm_state_snap;
     std::vector<ggml_tensor *> conv_state_snap;
 
+    // Second set of snapshot buffers kept at a longer timescale than
+    // ssm_state_snap: the session writes here after the last prompt
+    // prefill completes (one snapshot per successful prefill) so a
+    // follow-up call whose new prompt diverges mid-way from the cached
+    // stream can rewind to this anchor instead of fully resetting.
+    // Sized identically to ssm_state / conv_state above.
+    std::vector<ggml_tensor *> ssm_state_anchor;
+    std::vector<ggml_tensor *> conv_state_anchor;
+    int                        anchor_pos = 0;   // abs KV pos of snapshot; 0 = no anchor
+
     // Per-step SSM + conv inputs captured during a verify forward when
     // QwenGraphInputs::capture_delta_intermediate is true. Populated by
     // in-graph ggml_cpy ops in build_delta_net_block so their data lives in
@@ -233,6 +243,12 @@ struct TargetCache {
 void snapshot_ssm_state(TargetCache & c);
 // Restore the SSM+conv state from the snapshot.
 void restore_ssm_state(TargetCache & c);
+
+// Same as above but into/from the longer-lived anchor buffers. The
+// session wires these to "end of prefill" events so chat follow-ups
+// can rewind cheaply.
+void snapshot_anchor_state(TargetCache & c);
+void restore_anchor_state(TargetCache & c);
 
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
 // sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree

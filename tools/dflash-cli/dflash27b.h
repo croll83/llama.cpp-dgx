@@ -156,6 +156,21 @@ typedef struct {
 void dflash_session_get_last_stats(const dflash_session_t * s,
                                     dflash_session_stats_t * out);
 
+// Absolute KV position of the session's most recent end-of-prefill
+// snapshot. Returns 0 if no prefill has run yet (no usable anchor).
+// A caller with a new prompt whose common prefix with the cached token
+// stream is >= anchor_pos can call dflash_session_rewind_to_anchor to
+// restore the SSM / conv state from this snapshot and prefill only the
+// delta past anchor_pos instead of resetting from scratch.
+int dflash_session_anchor_pos(const dflash_session_t * s);
+
+// Restore SSM + conv state from the anchor snapshot and rewind kv_end
+// back to anchor_pos. No-op returning 0 if anchor_pos == 0. The session
+// is left ready to accept an append-mode call whose first delta token
+// is at absolute position anchor_pos.
+// Returns 0 on success, -1 on error.
+int dflash_session_rewind_to_anchor(dflash_session_t * s);
+
 // Callback invoked for each committed token. Return non-zero to keep going,
 // zero to abort (server-side generation stop).
 typedef int (*dflash_token_cb)(int32_t token, void * user_data);

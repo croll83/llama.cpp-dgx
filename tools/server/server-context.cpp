@@ -3173,11 +3173,27 @@ private:
         //     daemon skips prefill and goes straight to decode.
         //   * strict extension (lcp == cached.size() < n_prompt): delta has
         //     only the new tokens.
-        // We still fall back to RESET when cache has tokens beyond LCP
-        // (rewind would require an SSM state snapshot we don't keep).
-        const bool can_append = (lcp == (int) cached_toks.size()) && lcp > 0;
-        const int append_mode = can_append ? 1 : 0;
-        const int prefill_off = append_mode ? lcp : 0;
+        bool can_append = (lcp == (int) cached_toks.size()) && lcp > 0;
+        int  append_mode = can_append ? 1 : 0;
+        int  prefill_off = append_mode ? lcp : 0;
+
+        // Smart rewind: if the cached stream diverges past a position where
+        // the library took an end-of-prefill anchor, restore the anchor and
+        // treat the call as append-from-anchor. This saves re-prefilling the
+        // common conversation-history prefix when the chat template's
+        // re-tokenization of the assistant turn diverges mid-stream.
+        if (!can_append && slot.dflash_session) {
+            const int anchor = dflash_session_anchor_pos(slot.dflash_session);
+            if (anchor > 0 && lcp >= anchor && anchor < n_prompt) {
+                if (dflash_session_rewind_to_anchor(slot.dflash_session) == 0) {
+                    SRV_INF("DFlash rewind: slot=%d anchor=%d lcp=%d cached=%d (saved %d prefill toks)\n",
+                            slot.id, anchor, lcp, (int) cached_toks.size(), anchor);
+                    append_mode = 1;
+                    prefill_off = anchor;
+                    can_append  = true;
+                }
+            }
+        }
 
         std::vector<int32_t> delta_ids;
         delta_ids.reserve(n_prompt - prefill_off);
@@ -3188,7 +3204,10 @@ private:
         int n_gen = slot.task->params.n_predict;
         if (n_gen <= 0) n_gen = std::max(1, slot.n_ctx - n_prompt - 32);
 
-        slot.n_prompt_tokens_cache     = append_mode ? lcp : 0;
+        // Report the effective cache hit: prefill_off covers both the plain
+        // "strict extension" case (prefill_off == lcp) and the anchor-rewind
+        // case (prefill_off == anchor).
+        slot.n_prompt_tokens_cache     = append_mode ? prefill_off : 0;
         slot.n_prompt_tokens_processed = (int) delta_ids.size();
         slot.state              = SLOT_STATE_GENERATING;
         slot.t_start_generation = ggml_time_us();
