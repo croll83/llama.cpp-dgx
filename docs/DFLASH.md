@@ -116,6 +116,8 @@ KV + SSM state from a previous run on the same session (callers must ensure
 
 ## Measured results (GB10, 27B TQ3_4S target + Qwen3.6 draft, ddtree-budget=22)
 
+Single-request baseline:
+
 | Metric                         | Value          |
 |--------------------------------|----------------|
 | llama-server VRAM (vocab_only) | **19.7 GiB**   |
@@ -126,6 +128,26 @@ KV + SSM state from a previous run on the same session (callers must ensure
 | tok/s wall-clock (reasoning prompt)   | 15-20   |
 | tok/s dflash-internal (predicted_per_second) | 100-210 |
 | Streaming SSE (delta per token)| works          |
+
+### Multi-turn chat with anchor rewind (16K ctx, 641-token system prompt)
+
+Ran 4 consecutive `/v1/chat/completions` turns on the same slot, each
+appending user+assistant to the history (see `tools/dflash-cli/bench_chat.py`
+in the tree for the exact prompt). The anchor rewind kicks in starting at
+turn 2 and drops prefill by ~6× because the ~600 token system prompt
+prefix doesn't have to be re-ingested on every turn.
+
+| Turn | prompt_n | prefill_ms | decode_ms | tok/s | cached |
+|------|---------:|-----------:|----------:|------:|-------:|
+| 1 (fresh)  | 641 | 5316 | 2264 | 26.5 | 0   |
+| 2 (anchor) | 106 |  895 | 2600 | 23.1 | 624 |
+| 3 (anchor) | 114 | 1001 | 3130 | 19.2 | 704 |
+| 4 (anchor) | 108 |  898 | 2974 | 20.2 | 800 |
+
+`cached` is the number of tokens that came from the anchor snapshot
+(surfaced to the client via `timings.cache_n` / `usage.prompt_tokens_details.cached_tokens`).
+Wall-clock drops from 7.6s on the cold turn to ~3.5-4.2s on subsequent
+turns even though the history keeps growing.
 
 ## Known limitations / follow-ups
 
