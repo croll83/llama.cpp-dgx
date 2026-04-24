@@ -653,6 +653,14 @@ private:
 
         params_base = params;
 
+        // --dflash: skip loading the main model weights (dflash27b owns its
+        // own target cache + draft). Saves ~14 GB VRAM. The llama_model
+        // keeps the tokenizer, chat templates, and vocab metadata that
+        // process_token / the sampler still need.
+        if (params_base.dflash) {
+            params_base.vocab_only_model = true;
+        }
+
         llama_init = common_init_from_params(params_base);
 
         // propagate model-metadata sampling defaults back to caller
@@ -3082,6 +3090,18 @@ private:
     }
 
     void process_slot_dflash(server_slot & slot) {
+        // With --dflash the main model is loaded vocab_only to save ~14 GB
+        // VRAM (all inference happens inside dflash_session), which makes
+        // llama_n_ctx_seq(ctx) return a small value. Restore slot.n_ctx
+        // to the dflash target cache size so the in-context-size check
+        // inside process_token doesn't spuriously truncate at the first
+        // generated token.
+        if (params_base.dflash) {
+            slot.n_ctx = params_base.dflash_max_ctx > 0
+                             ? params_base.dflash_max_ctx
+                             : (int) params_base.n_ctx;
+        }
+
         // Reset per-request slot state. The normal llama-server prompt-eval
         // path does this piecemeal (n_decoded reset at line ~2678, text
         // clears inside reset()); here we need to mirror those so counters
