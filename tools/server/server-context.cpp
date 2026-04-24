@@ -679,8 +679,17 @@ private:
         // own target cache + draft). Saves ~14 GB VRAM. The llama_model
         // keeps the tokenizer, chat templates, and vocab metadata that
         // process_token / the sampler still need.
-        if (params_base.dflash) {
+        //
+        // Exception: mmproj (vision) requires the text model's embedding
+        // dimension at load time for the clip adapter shape check, which
+        // is 0 under vocab_only and aborts with "mismatch between text model
+        // (n_embd = 0) and mmproj". When both are requested, keep the full
+        // model load — the VRAM overhead (one extra copy of weights) is
+        // unavoidable today.
+        if (params_base.dflash && params_base.mmproj.path.empty()) {
             params_base.vocab_only_model = true;
+        } else if (params_base.dflash) {
+            SRV_INF("%s", "DFlash + mmproj: keeping main-model weights resident (vocab_only disabled) to satisfy mmproj n_embd validation\n");
         }
 
         llama_init = common_init_from_params(params_base);
@@ -2098,7 +2107,24 @@ private:
     }
 
     void update_slots() {
-        if (dflash_weights) { update_slots_dflash(); return; }
+        // DFlash dispatcher handles text-only slots. If any active slot has
+        // multimodal tokens (image embeddings from mmproj), fall through to
+        // the standard update_slots path for this iteration — dflash's
+        // target graph is text-only and process_slot_dflash asserts on
+        // non-text tokens via server_tokens::get_text_tokens().
+        if (dflash_weights) {
+            bool any_mtmd = false;
+            for (auto & s : slots) {
+                if (s.is_processing() && s.prompt.tokens.has_mtmd) {
+                    any_mtmd = true;
+                    break;
+                }
+            }
+            if (!any_mtmd) {
+                update_slots_dflash();
+                return;
+            }
+        }
         // check if all slots are idle
         {
             bool all_idle = true;
