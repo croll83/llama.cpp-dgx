@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -201,15 +202,19 @@ struct TargetCache {
     std::vector<ggml_tensor *> ssm_state_snap;
     std::vector<ggml_tensor *> conv_state_snap;
 
-    // Second set of snapshot buffers kept at a longer timescale than
-    // ssm_state_snap: the session writes here after the last prompt
-    // prefill completes (one snapshot per successful prefill) so a
-    // follow-up call whose new prompt diverges mid-way from the cached
-    // stream can rewind to this anchor instead of fully resetting.
-    // Sized identically to ssm_state / conv_state above.
-    std::vector<ggml_tensor *> ssm_state_anchor;
-    std::vector<ggml_tensor *> conv_state_anchor;
-    int                        anchor_pos = 0;   // abs KV pos of snapshot; 0 = no anchor
+    // Multi-anchor snapshot ring. Each slot stores SSM + conv state at a
+    // specific absolute KV position — taken during the last full prefill at
+    // geometrically-spaced offsets (≈ P/8, P/4, P/2, P - backoff). Follow-up
+    // calls whose prompt diverges somewhere inside the cached stream pick
+    // the largest anchor <= lcp and rewind there instead of fully
+    // resetting, covering both late (end-of-prompt template header) and
+    // early (mid-history) divergence points.
+    //
+    // Outer dim = DFLASH_ANCHOR_SLOTS. Inner = n_delta_layers (48).
+    static constexpr int DFLASH_ANCHOR_SLOTS = 4;
+    std::vector<std::vector<ggml_tensor *>> ssm_state_anchors;    // [K][n_delta]
+    std::vector<std::vector<ggml_tensor *>> conv_state_anchors;   // [K][n_delta]
+    std::array<int, DFLASH_ANCHOR_SLOTS>    anchor_positions{};   // 0 = empty slot
 
     // Per-step SSM + conv inputs captured during a verify forward when
     // QwenGraphInputs::capture_delta_intermediate is true. Populated by
@@ -244,11 +249,12 @@ void snapshot_ssm_state(TargetCache & c);
 // Restore the SSM+conv state from the snapshot.
 void restore_ssm_state(TargetCache & c);
 
-// Same as above but into/from the longer-lived anchor buffers. The
-// session wires these to "end of prefill" events so chat follow-ups
-// can rewind cheaply.
-void snapshot_anchor_state(TargetCache & c);
-void restore_anchor_state(TargetCache & c);
+// Same as above but into/from a specific slot of the long-lived
+// multi-anchor ring. The session wires these to geometrically-spaced
+// positions during the last full prefill so chat follow-ups can
+// rewind to whichever anchor fits best.
+void snapshot_anchor_state(TargetCache & c, int slot);
+void restore_anchor_state(TargetCache & c, int slot);
 
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
 // sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree

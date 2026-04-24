@@ -157,19 +157,28 @@ void dflash_session_get_last_stats(const dflash_session_t * s,
                                     dflash_session_stats_t * out);
 
 // Absolute KV position of the session's most recent end-of-prefill
-// snapshot. Returns 0 if no prefill has run yet (no usable anchor).
-// A caller with a new prompt whose common prefix with the cached token
-// stream is >= anchor_pos can call dflash_session_rewind_to_anchor to
-// restore the SSM / conv state from this snapshot and prefill only the
-// delta past anchor_pos instead of resetting from scratch.
+// snapshot. Returns 0 if no prefill has run yet. For multi-anchor
+// sessions this returns the MAXIMUM stored anchor position; callers
+// that want to pick an anchor by an upper bound (e.g. lcp of a new
+// prompt) should prefer dflash_session_best_anchor_pos below.
 int dflash_session_anchor_pos(const dflash_session_t * s);
 
-// Restore SSM + conv state from the anchor snapshot and rewind kv_end
-// back to anchor_pos. No-op returning 0 if anchor_pos == 0. The session
-// is left ready to accept an append-mode call whose first delta token
-// is at absolute position anchor_pos.
+// Returns the largest stored anchor position <= target_pos, or 0 if no
+// anchor satisfies that bound. Useful when the caller knows it can
+// only trust a rewind that sits within its lcp against the cached
+// token stream: passing target_pos = lcp yields the best rewind candidate.
+int dflash_session_best_anchor_pos(const dflash_session_t * s, int target_pos);
+
+// Restore SSM + conv state from the MAX-positioned anchor snapshot and
+// rewind kv_end back to that position. Equivalent to
+// dflash_session_rewind_to_pos(s, dflash_session_anchor_pos(s)).
 // Returns 0 on success, -1 on error.
 int dflash_session_rewind_to_anchor(dflash_session_t * s);
+
+// Rewind to the best anchor whose position is <= target_pos (typically
+// the caller's lcp). Returns the actual rewind position on success
+// (0 < ret <= target_pos), or -1 if no suitable anchor exists.
+int dflash_session_rewind_to_pos(dflash_session_t * s, int target_pos);
 
 // Callback invoked for each committed token. Return non-zero to keep going,
 // zero to abort (server-side generation stop).

@@ -874,23 +874,59 @@ extern "C" void dflash_session_get_last_stats(const dflash_session_t * s,
     *out = s->last_stats;
 }
 
+// Find the slot whose anchor position is the largest value <= target_pos.
+// Returns -1 if no slot satisfies the bound. Internal use only.
+static int find_best_anchor_slot(const TargetCache & c, int target_pos) {
+    int best_slot = -1;
+    int best_pos  = 0;
+    for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+        const int p = c.anchor_positions[k];
+        if (p > 0 && p <= target_pos && p > best_pos) {
+            best_slot = k;
+            best_pos  = p;
+        }
+    }
+    return best_slot;
+}
+
 extern "C" int dflash_session_anchor_pos(const dflash_session_t * s) {
-    return s ? s->cache.anchor_pos : 0;
+    if (!s) return 0;
+    // Backward-compat: return the maximum anchor position across all slots.
+    // Callers that want to pick by a target should use
+    // dflash_session_best_anchor_pos(s, target).
+    int best = 0;
+    for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+        best = std::max(best, s->cache.anchor_positions[k]);
+    }
+    return best;
+}
+
+extern "C" int dflash_session_best_anchor_pos(const dflash_session_t * s, int target_pos) {
+    if (!s) return 0;
+    const int slot = find_best_anchor_slot(s->cache, target_pos);
+    return slot < 0 ? 0 : s->cache.anchor_positions[slot];
 }
 
 extern "C" int dflash_session_rewind_to_anchor(dflash_session_t * s) {
     if (!s) return -1;
-    if (s->cache.anchor_pos <= 0) return 0;  // nothing to do
+    // Rewind to the MAX anchor (backward-compat). Callers that want a
+    // specific target should use dflash_session_rewind_to_pos.
+    const int pos = dflash_session_anchor_pos(s);
+    if (pos <= 0) return 0;  // nothing to do
+    return dflash_session_rewind_to_pos(s, pos);
+}
 
-    // Restore SSM + conv state from the anchor. KV / target_feat live as
-    // per-position slots — we don't need to clear them because the next
-    // prefill-from-anchor will overwrite the positions in [anchor_pos..new_end].
-    restore_anchor_state(s->cache);
-    s->cache.cur_pos = s->cache.anchor_pos;
-    s->kv_end        = s->cache.anchor_pos;
-    // last_tok stays whatever it was; the caller will overwrite it by
-    // feeding the delta tokens and reading the new last-row logits.
-    return 0;
+extern "C" int dflash_session_rewind_to_pos(dflash_session_t * s, int target_pos) {
+    if (!s) return -1;
+    const int slot = find_best_anchor_slot(s->cache, target_pos);
+    if (slot < 0) return -1;     // no usable anchor
+    const int pos  = s->cache.anchor_positions[slot];
+    restore_anchor_state(s->cache, slot);
+    s->cache.cur_pos = pos;
+    s->kv_end        = pos;
+    // last_tok stays whatever it was; the caller feeds the delta tokens
+    // and reads the new last-row logits from prefill to refresh it.
+    return pos;
 }
 
 // Runs one request end-to-end: (optional reset) + prefill + decode loop.
@@ -1016,11 +1052,29 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     // (useless for rewind once lcp < prompt_len). We bump the backoff to
     // max(32, PREFILL_UBATCH + 32) so there's always at least one boundary
     // between the anchor and the end.
-    const int anchor_backoff =
-        std::max(32, PREFILL_UBATCH + 32);
-    const int anchor_target_pos = prefill_kv_offset +
-        std::max(0, prompt_len - anchor_backoff);
-    bool anchor_taken_this_prefill = false;
+    // Multi-anchor checkpoints: compute up to DFLASH_ANCHOR_SLOTS target
+    // positions at geometrically-decreasing offsets (≈ prompt_len × {1/8,
+    // 1/4, 1/2, 1}) minus a ubatch-aware backoff on the last slot. This
+    // gives follow-up calls a rewind point whether they diverge near the
+    // end of prompt (late slot) or inside older history (early slot).
+    const int anchor_backoff = std::max(32, PREFILL_UBATCH + 32);
+    std::array<int, TargetCache::DFLASH_ANCHOR_SLOTS> anchor_target{};
+    // Slot K-1 sits just before the divergence-prone tail; earlier slots
+    // at halvings of prompt_len. Slots for very short prompts may collapse
+    // to 0 and stay unused.
+    for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+        const int shift = TargetCache::DFLASH_ANCHOR_SLOTS - 1 - k;  // K-1, K-2, ..., 0
+        int target;
+        if (shift == 0) {
+            target = std::max(0, prompt_len - anchor_backoff);
+        } else {
+            target = prompt_len >> shift;                            // /8, /4, /2
+        }
+        anchor_target[k] = prefill_kv_offset + target;
+    }
+    // Track per-slot "has been taken during this prefill" to avoid double-snap.
+    std::array<bool, TargetCache::DFLASH_ANCHOR_SLOTS> slot_taken{};
+    slot_taken.fill(false);
 
     for (int start = 0; start < prompt_len; start += PREFILL_UBATCH) {
         const int n_tokens  = std::min(PREFILL_UBATCH, prompt_len - start);
@@ -1076,22 +1130,21 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         last_tok = argmax_f32(pf_logits_buf.data(), vocab);
         committed = abs_start + n_tokens;
 
-        // Anchor checkpoint: take the long-lived SSM/conv snapshot as
-        // soon as we cross anchor_target_pos. Doing it mid-prefill (rather
-        // than post-prefill) means the anchor sits BEFORE the typical
-        // chat-template divergence point at the tail of the prompt.
-        //
-        // Only snap on FULL prefill (prefill_kv_offset == 0). Append-mode
-        // continuations arrive as small deltas, so re-snapping during them
-        // would move the anchor forward and defeat the next rewind — the
-        // anchor set during the last full prefill is still a valid
-        // rewind target as long as it's older than the new lcp.
-        if (!anchor_taken_this_prefill &&
-            prefill_kv_offset == 0 &&
-            committed >= anchor_target_pos) {
-            snapshot_anchor_state(cache);
-            cache.anchor_pos = committed;
-            anchor_taken_this_prefill = true;
+        // Multi-anchor checkpoints: take a snapshot into every slot whose
+        // target has just been crossed. Only snaps on FULL prefill
+        // (prefill_kv_offset == 0) — append-mode continuations keep the
+        // anchors from the last cold prefill so chat follow-ups still
+        // benefit from them.
+        if (prefill_kv_offset == 0) {
+            for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+                if (!slot_taken[k] &&
+                    anchor_target[k] > 0 &&
+                    committed >= anchor_target[k]) {
+                    snapshot_anchor_state(cache, k);
+                    cache.anchor_positions[k] = committed;
+                    slot_taken[k] = true;
+                }
+            }
         }
     }
     auto t_pf1 = std::chrono::steady_clock::now();
@@ -1100,13 +1153,17 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
                 last_tok);
 
-    // Fallback anchor: if the prefill loop didn't take one during a full
-    // prefill — typically because the prompt is shorter than the
-    // ubatch-aware backoff — snap the post-prefill state. Only runs on
-    // append_mode=0 for the same reason as the in-loop check.
-    if (!anchor_taken_this_prefill && prefill_kv_offset == 0 && committed > 0) {
-        snapshot_anchor_state(cache);
-        cache.anchor_pos = committed;
+    // Fallback anchor: if no slot got filled during a FULL prefill — typically
+    // because the prompt is shorter than the ubatch-aware backoff and every
+    // anchor_target collapsed to 0 — snap the post-prefill state into slot 0
+    // so the next call has at least something to rewind to.
+    if (prefill_kv_offset == 0 && committed > 0) {
+        bool any = false;
+        for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) any = any || slot_taken[k];
+        if (!any) {
+            snapshot_anchor_state(cache, 0);
+            cache.anchor_positions[0] = committed;
+        }
     }
 
     // ── DFlash decode loop

@@ -3177,19 +3177,22 @@ private:
         int  append_mode = can_append ? 1 : 0;
         int  prefill_off = append_mode ? lcp : 0;
 
-        // Smart rewind: if the cached stream diverges past a position where
-        // the library took an end-of-prefill anchor, restore the anchor and
-        // treat the call as append-from-anchor. This saves re-prefilling the
-        // common conversation-history prefix when the chat template's
-        // re-tokenization of the assistant turn diverges mid-stream.
+        // Smart rewind: pick the largest session anchor position <= lcp and
+        // restore that snapshot, so the prefill only re-ingests the delta
+        // past it. The library stores up to K=4 anchors taken during the
+        // cold prefill at geometric positions (~P/8, P/4, P/2, P-backoff),
+        // which covers both late divergence (chat-template tail) and
+        // earlier divergence (mid-history). Falls through to full reset
+        // when no anchor fits (lcp is smaller than any stored anchor).
         if (!can_append && slot.dflash_session) {
-            const int anchor = dflash_session_anchor_pos(slot.dflash_session);
-            if (anchor > 0 && lcp >= anchor && anchor < n_prompt) {
-                if (dflash_session_rewind_to_anchor(slot.dflash_session) == 0) {
+            const int best = dflash_session_best_anchor_pos(slot.dflash_session, lcp);
+            if (best > 0 && best < n_prompt) {
+                const int got = dflash_session_rewind_to_pos(slot.dflash_session, lcp);
+                if (got > 0) {
                     SRV_INF("DFlash rewind: slot=%d anchor=%d lcp=%d cached=%d (saved %d prefill toks)\n",
-                            slot.id, anchor, lcp, (int) cached_toks.size(), anchor);
+                            slot.id, got, lcp, (int) cached_toks.size(), got);
                     append_mode = 1;
-                    prefill_off = anchor;
+                    prefill_off = got;
                     can_append  = true;
                 }
             }

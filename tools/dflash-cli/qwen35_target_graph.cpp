@@ -89,19 +89,19 @@ bool create_target_cache(const TargetWeights & w,
     out.conv_state.assign(n_delta, nullptr);
     out.ssm_state_snap.assign(n_delta, nullptr);
     out.conv_state_snap.assign(n_delta, nullptr);
-    out.ssm_state_anchor.assign(n_delta, nullptr);
-    out.conv_state_anchor.assign(n_delta, nullptr);
-    out.anchor_pos = 0;
+    out.ssm_state_anchors.assign(TargetCache::DFLASH_ANCHOR_SLOTS, std::vector<ggml_tensor *>(n_delta, nullptr));
+    out.conv_state_anchors.assign(TargetCache::DFLASH_ANCHOR_SLOTS, std::vector<ggml_tensor *>(n_delta, nullptr));
+    out.anchor_positions.fill(0);
     out.ssm_intermediate.assign(n_delta, nullptr);
     out.conv_input_cache.assign(n_delta, nullptr);
 
     // Size the cache ggml context to hold all state tensors.
     //   per full-attn layer  : 2 (K, V)
-    //   per delta-net layer  : 8 (ssm, conv, ssm_snap, conv_snap,
-    //                             ssm_anchor, conv_anchor,
+    //   per delta-net layer  : 6 + 2*K (ssm, conv, ssm_snap, conv_snap,
+    //                             K × ssm_anchor, K × conv_anchor,
     //                             ssm_intermediate, conv_input_cache)
     //   top-level            : 1 (target_feat)
-    const int n_tensors = 2 * n_full_attn + 8 * n_delta + 1;
+    const int n_tensors = 2 * n_full_attn + (6 + 2 * TargetCache::DFLASH_ANCHOR_SLOTS) * n_delta + 1;
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(n_tensors + 32) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -164,15 +164,21 @@ bool create_target_cache(const TargetWeights & w,
                                                   q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
             ggml_tensor * Sn = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
                                                   q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
-            ggml_tensor * Sa = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
+            ggml_tensor * Sa[TargetCache::DFLASH_ANCHOR_SLOTS];
+            for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+                Sa[k] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
+                                           q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
+            }
             // conv_state: [kernel-1, conv_channels]
             ggml_tensor * C  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
                                                   q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
             ggml_tensor * Cn = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
                                                   q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
-            ggml_tensor * Ca = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                  q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
+            ggml_tensor * Ca[TargetCache::DFLASH_ANCHOR_SLOTS];
+            for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+                Ca[k] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+                                           q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
+            }
             // ssm_intermediate: [S_v, S_v, H_v, max_verify_tokens] — one SSM
             // state per verify-block token. Sized to cover the largest verify
             // n_tokens we'll use (chain q_len=16 or DDTree 1+budget).
@@ -192,16 +198,22 @@ bool create_target_cache(const TargetWeights & w,
             std::snprintf(name, sizeof(name), "conv_state_%d", il);        ggml_set_name(C,  name);
             std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);    ggml_set_name(Sn, name);
             std::snprintf(name, sizeof(name), "conv_state_snap_%d", il);   ggml_set_name(Cn, name);
-            std::snprintf(name, sizeof(name), "ssm_state_anchor_%d", il);  ggml_set_name(Sa, name);
-            std::snprintf(name, sizeof(name), "conv_state_anchor_%d", il); ggml_set_name(Ca, name);
+            for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+                std::snprintf(name, sizeof(name), "ssm_state_anchor%d_%d", k, il);
+                ggml_set_name(Sa[k], name);
+                std::snprintf(name, sizeof(name), "conv_state_anchor%d_%d", k, il);
+                ggml_set_name(Ca[k], name);
+            }
             std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il);  ggml_set_name(Si, name);
             std::snprintf(name, sizeof(name), "conv_input_cache_%d", il);  ggml_set_name(Ci, name);
-            out.ssm_state[dn_idx]         = S;
-            out.conv_state[dn_idx]        = C;
-            out.ssm_state_snap[dn_idx]    = Sn;
-            out.conv_state_snap[dn_idx]   = Cn;
-            out.ssm_state_anchor[dn_idx]  = Sa;
-            out.conv_state_anchor[dn_idx] = Ca;
+            out.ssm_state[dn_idx]       = S;
+            out.conv_state[dn_idx]      = C;
+            out.ssm_state_snap[dn_idx]  = Sn;
+            out.conv_state_snap[dn_idx] = Cn;
+            for (int k = 0; k < TargetCache::DFLASH_ANCHOR_SLOTS; k++) {
+                out.ssm_state_anchors[k][dn_idx]  = Sa[k];
+                out.conv_state_anchors[k][dn_idx] = Ca[k];
+            }
             out.ssm_intermediate[dn_idx] = Si;
             out.conv_input_cache[dn_idx] = Ci;
             dn_idx++;
@@ -262,9 +274,9 @@ void free_target_cache(TargetCache & c) {
     c.conv_state.clear();
     c.ssm_state_snap.clear();
     c.conv_state_snap.clear();
-    c.ssm_state_anchor.clear();
-    c.conv_state_anchor.clear();
-    c.anchor_pos = 0;
+    c.ssm_state_anchors.clear();
+    c.conv_state_anchors.clear();
+    c.anchor_positions.fill(0);
     c.ssm_intermediate.clear();
     c.conv_input_cache.clear();
     c.target_feat = nullptr;
@@ -287,20 +299,23 @@ void restore_ssm_state(TargetCache & c) {
     }
 }
 
-// Longer-timescale snapshot kept at the end of the last prompt prefill
-// so follow-up calls that diverge from the cached stream can rewind to
-// this anchor instead of resetting.
-void snapshot_anchor_state(TargetCache & c) {
+// Longer-timescale snapshot into a specific slot of the multi-anchor
+// ring. The session writes to each of DFLASH_ANCHOR_SLOTS at
+// geometrically-spaced positions during the last full prefill so a
+// follow-up call can pick the best anchor <= lcp to rewind to.
+void snapshot_anchor_state(TargetCache & c, int slot) {
+    GGML_ASSERT(slot >= 0 && slot < TargetCache::DFLASH_ANCHOR_SLOTS);
     for (size_t i = 0; i < c.ssm_state.size(); i++) {
-        ggml_backend_tensor_copy(c.ssm_state[i], c.ssm_state_anchor[i]);
-        ggml_backend_tensor_copy(c.conv_state[i], c.conv_state_anchor[i]);
+        ggml_backend_tensor_copy(c.ssm_state[i],  c.ssm_state_anchors[slot][i]);
+        ggml_backend_tensor_copy(c.conv_state[i], c.conv_state_anchors[slot][i]);
     }
 }
 
-void restore_anchor_state(TargetCache & c) {
+void restore_anchor_state(TargetCache & c, int slot) {
+    GGML_ASSERT(slot >= 0 && slot < TargetCache::DFLASH_ANCHOR_SLOTS);
     for (size_t i = 0; i < c.ssm_state.size(); i++) {
-        ggml_backend_tensor_copy(c.ssm_state_anchor[i], c.ssm_state[i]);
-        ggml_backend_tensor_copy(c.conv_state_anchor[i], c.conv_state[i]);
+        ggml_backend_tensor_copy(c.ssm_state_anchors[slot][i],  c.ssm_state[i]);
+        ggml_backend_tensor_copy(c.conv_state_anchors[slot][i], c.conv_state[i]);
     }
 }
 
