@@ -68,11 +68,16 @@ Then the standard OpenAI API is served:
   produced by DFlash. `temperature`, `top_p`, `grammar`, `logit_bias` are
   ignored.
 - ~~The main model weights are loaded twice~~ *(Fixed in commit 0efab257a — main model now loads vocab_only when --dflash is set, saving ~14 GB VRAM. process_slot_dflash restores slot.n_ctx to the dflash target cache size so the normal in-context-size check keeps working.)*
-- Prompt caching only hits when the new prompt is a strict extension of
-  the cached token stream. Chat-template re-tokenization across turns can
-  break strict extension; a follow-up will either align
-  `slot.prompt.tokens` with the template view or teach the dflash session
-  to rewind KV via an SSM snapshot.
+- ~~Prompt caching only hits when the new prompt is a strict extension of
+  the cached token stream.~~ *(Partially fixed — the session now drops
+  an SSM + conv anchor ~32 tokens before the end of each prefill, and
+  process_slot_dflash rewinds to it when the follow-up LCP clears the
+  anchor but doesn't match the full cached stream. This recovers the
+  common chat-template case where only the last ~20 tokens re-tokenize
+  differently across turns. Works both ways: strict-extension still
+  uses the classic append path; mid-prompt divergence still has to
+  fall back to reset. APIs: `dflash_session_anchor_pos` +
+  `dflash_session_rewind_to_anchor`.)*
 - `cpy.cu` in ggml-cuda has no `F32 → TURBO*/TQ3_0` kernels, so dflash's
   explicit Q/K/V → KV copy cannot use TurboQuant-KV types yet. Follow-up.
 
@@ -97,6 +102,11 @@ int  dflash_session_run(s, prompt_ids, n_prompt, n_gen, append_mode,
 int  dflash_session_kv_end(s);
 int  dflash_session_reset(s);
 void dflash_session_destroy(s);
+
+// Per-run stats + cross-turn rewind:
+void dflash_session_get_last_stats(s, /*out*/ &stats);
+int  dflash_session_anchor_pos(s);          // 0 if no anchor yet
+int  dflash_session_rewind_to_anchor(s);    // 0 on success, -1 on error
 ```
 
 Lifetime rule: every session created from shared weights must be destroyed
@@ -121,12 +131,12 @@ KV + SSM state from a previous run on the same session (callers must ensure
 
 1. Greedy only — llama-server's sampler is bypassed. Temperature /
    top_p / grammar / logit_bias are ignored.
-2. Prompt caching: hits only on strict extension (cached ⊂ new) *on the
-   same slot*. Chat turns re-tokenized via the template usually don't
-   match strictly; see the rewind/SSM-snapshot note in server-context.cpp.
-   With multi-slot active, the server's default LRU slot selection can
-   route a follow-up turn to a different slot and miss the cache entirely;
-   `--slot-prompt-similarity` can help route by prefix overlap.
+2. Prompt caching: strict extension works; cross-turn with chat-template
+   re-tokenization now works when divergence happens in the last ~32
+   tokens via anchor rewind (see MVP caveats). Earlier divergence still
+   triggers full reset. Multi-slot routing needs `--slot-prompt-similarity`
+   to pin follow-ups to the slot that has the warm anchor — default LRU
+   can land on the wrong slot.
 3. TurboQuant V-cache not wired in — ggml-cuda/cpy.cu has no F32 → TQ3/
    TURBO* kernels so dflash's Q/K/V→KV copy can't use them.
 4. GPU compute still serializes on one CUDA device — two concurrent slots
