@@ -140,6 +140,22 @@ int dflash_session_kv_end(const dflash_session_t * s);
 // Last logits seed token (useful for picking up bonus after prefill).
 int32_t dflash_session_last_tok(const dflash_session_t * s);
 
+// Per-request stats captured during the most recent dflash_session_run.
+// Populated on success (return >= 0); contents are undefined after error.
+typedef struct {
+    int    n_generated;       // committed tokens emitted through the callback
+    int    n_draft_steps;     // number of draft-forward / verify rounds
+    int    n_accept_sum;      // total draft tokens accepted across all rounds
+    int    prefill_tokens;    // tokens processed in the prefill phase
+    double prefill_seconds;   // wall clock of prefill
+    double decode_seconds;    // wall clock of the draft+verify loop
+} dflash_session_stats_t;
+
+// Copy the last-run stats into `out`. Zero-fills `out` if the session has
+// never been run. Safe to call between runs; overwritten on the next run.
+void dflash_session_get_last_stats(const dflash_session_t * s,
+                                    dflash_session_stats_t * out);
+
 // Callback invoked for each committed token. Return non-zero to keep going,
 // zero to abort (server-side generation stop).
 typedef int (*dflash_token_cb)(int32_t token, void * user_data);

@@ -3227,6 +3227,23 @@ private:
             slot.prompt.tokens.insert(cc.generated);
         }
 
+        // Per-request DFlash telemetry: accept-rate and tok/s. Printed
+        // at INFO level so operators can tune ddtree-budget without
+        // dropping into the library-level stderr spam.
+        dflash_session_stats_t stats{};
+        dflash_session_get_last_stats(slot.dflash_session, &stats);
+        const double tps_decode = stats.decode_seconds > 0.0
+            ? stats.n_generated / stats.decode_seconds : 0.0;
+        const double accept_pct = stats.n_draft_steps > 0
+            ? 100.0 * stats.n_accept_sum / ((double) stats.n_draft_steps * 16.0 /* block */)
+            : 0.0;
+        SLT_INF(slot,
+                "DFlash done: slot=%d out=%d prefill=%.2fs (%d toks) decode=%.2fs (%.1f tok/s) "
+                "draft_steps=%d accept=%.1f%% avg_commit/step=%.2f\n",
+                slot.id, n_out, stats.prefill_seconds, stats.prefill_tokens,
+                stats.decode_seconds, tps_decode, stats.n_draft_steps, accept_pct,
+                stats.n_draft_steps > 0 ? (double) stats.n_generated / stats.n_draft_steps : 0.0);
+
         send_final_response(slot);
         slot.release();
     }

@@ -742,6 +742,10 @@ struct dflash_session_s {
     // `static` — unsafe across concurrent sessions).
     std::vector<float>   ddtree_top_log_probs;
     std::vector<int32_t> ddtree_top_token_ids;
+
+    // Populated at the end of each dflash_session_run (0-initialized until
+    // the first run completes). Read via dflash_session_get_last_stats.
+    dflash_session_stats_t last_stats{};
 };
 
 extern "C" dflash_session_params_t dflash_session_default_params(void) {
@@ -862,6 +866,16 @@ extern "C" int32_t dflash_session_last_tok(const dflash_session_t * s) {
     return s ? s->last_tok : -1;
 }
 
+extern "C" void dflash_session_get_last_stats(const dflash_session_t * s,
+                                               dflash_session_stats_t * out) {
+    if (!out) return;
+    if (!s) {
+        *out = dflash_session_stats_t{};
+        return;
+    }
+    *out = s->last_stats;
+}
+
 // Runs one request end-to-end: (optional reset) + prefill + decode loop.
 // Returns number of tokens emitted via the callback (0..n_gen), or -1 on error.
 extern "C" int dflash_session_run(dflash_session_t * s,
@@ -904,10 +918,6 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     auto stream_emit = [&](int32_t tok) {
         if (!cb || cb_want_stop) return;
         if (cb(tok, user_data) == 0) cb_want_stop = true;
-    };
-    auto emit_and_continue = [&](int32_t tok) -> bool {
-        stream_emit(tok);
-        return !cb_want_stop;
     };
 
     std::vector<int32_t> prompt(prompt_ids, prompt_ids + n_prompt);
@@ -1860,8 +1870,16 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     for (int i = tail_start; i < (int)out_all.size(); i++) std::printf("%d ", out_all[i]);
     std::printf("\n");
 
-    // session_run end
-
+    // Capture per-run stats. Readers use dflash_session_get_last_stats().
+    // Prefill time is measured between t_pf0 and t_pf1, decode between
+    // t_gen0 and t_gen1; we already have them in scope above.
+    s->last_stats = dflash_session_stats_t{};
+    s->last_stats.n_generated     = n_generated;
+    s->last_stats.n_draft_steps   = n_draft_steps;
+    s->last_stats.n_accept_sum    = n_accept_sum;
+    s->last_stats.prefill_tokens  = prompt_len;
+    s->last_stats.prefill_seconds = std::chrono::duration<double>(t_pf1 - t_pf0).count();
+    s->last_stats.decode_seconds  = gen_s;
 
     s->kv_end = committed;
     s->last_tok = last_tok;
