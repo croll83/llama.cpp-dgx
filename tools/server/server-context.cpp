@@ -686,10 +686,6 @@ private:
                 SRV_ERR("%s", "--dflash requires --dflash-draft <safetensors>\n");
                 return false;
             }
-            if (params_base.n_parallel != 1) {
-                SRV_ERR("%s", "--dflash currently requires -np 1 (single slot)\n");
-                return false;
-            }
             ggml_backend_t be = ggml_backend_cuda_init(0);
             if (!be) {
                 SRV_ERR("%s", "DFlash: ggml_backend_cuda_init failed\n");
