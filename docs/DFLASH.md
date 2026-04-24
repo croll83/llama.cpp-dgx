@@ -33,9 +33,15 @@ llama-server \
     --dflash-budget 22 \
     --dflash-max-ctx 16384 \
     --host 0.0.0.0 --port 30000 \
-    -c 16384 -np 1 -ngl 99 \
+    -c 16384 -np 2 -ngl 99 \
     --alias my-model
 ```
+
+`-np N` spins up `N` slots, each with its own DFlash session but sharing
+the target GGUF + draft safetensors on VRAM (loaded once via
+`dflash_weights_load`). GPU compute still serializes on a single device;
+the split buys per-slot state isolation (KV + SSM) so concurrent chat
+turns don't corrupt each other.
 
 Then the standard OpenAI API is served:
 - `GET  /v1/models`              — lists `my-model`
@@ -52,8 +58,12 @@ Then the standard OpenAI API is served:
 
 ## MVP caveats
 
-- `-np 1` only (single slot). Multi-slot would need one `dflash_session_t`
-  per slot.
+- ~~`-np 1` only (single slot).~~ *(Fixed — weights load once via
+  `dflash_weights_load`, per-slot sessions allocated with
+  `dflash_session_create_shared`. Concurrent slots produce distinct per-slot
+  output; GPU compute still serializes on the single CUDA device, but
+  KV + SSM state is fully isolated per slot so slot 0 and slot 1 can hold
+  independent chat histories.)*
 - Greedy decoding only — the llama-server sampler is bypassed for tokens
   produced by DFlash. `temperature`, `top_p`, `grammar`, `logit_bias` are
   ignored.
@@ -68,11 +78,20 @@ Then the standard OpenAI API is served:
 
 ## Library API (`tools/dflash-cli/dflash27b.h`)
 
-Intended for direct use in other integrations:
+Intended for direct use in other integrations. Use the shared-weights form
+when building multi-slot hosts (loads weights once for the process):
 
 ```c
+// Shared weights (multi-slot):
+dflash_weights_t * dflash_weights_load(target_gguf, draft_safetensors, backend);
+dflash_session_t * dflash_session_create_shared(weights, params, backend);
+void               dflash_weights_free(weights);
+
+// Self-contained (one-shot CLIs, single slot):
 dflash_session_t * dflash_session_create(target_gguf, draft_safetensors,
                                           params, backend);
+
+// Common:
 int  dflash_session_run(s, prompt_ids, n_prompt, n_gen, append_mode,
                          token_cb, user_data);
 int  dflash_session_kv_end(s);
@@ -80,8 +99,10 @@ int  dflash_session_reset(s);
 void dflash_session_destroy(s);
 ```
 
-Set `append_mode=1` to reuse cached KV + SSM state from a previous run
-(callers must ensure `prompt_ids` is the delta past `dflash_session_kv_end`).
+Lifetime rule: every session created from shared weights must be destroyed
+before `dflash_weights_free` is called. Set `append_mode=1` to reuse cached
+KV + SSM state from a previous run on the same session (callers must ensure
+`prompt_ids` is the delta past `dflash_session_kv_end`).
 
 ## Measured results (GB10, 27B TQ3_4S target + Qwen3.6 draft, ddtree-budget=22)
 
@@ -98,12 +119,16 @@ Set `append_mode=1` to reuse cached KV + SSM state from a previous run
 
 ## Known limitations / follow-ups
 
-1. Single slot (-np 1) — multi-slot needs 1 dflash_session per slot or a
-   queue; target weights would need to be shared between sessions.
-2. Greedy only — llama-server's sampler is bypassed. Temperature /
+1. Greedy only — llama-server's sampler is bypassed. Temperature /
    top_p / grammar / logit_bias are ignored.
-3. Prompt caching: hits only on strict extension (cached ⊂ new). Chat
-   turns re-tokenized via the template usually don't match strictly;
-   see the rewind/SSM-snapshot note in server-context.cpp.
-4. TurboQuant V-cache not wired in — ggml-cuda/cpy.cu has no F32 → TQ3/
+2. Prompt caching: hits only on strict extension (cached ⊂ new) *on the
+   same slot*. Chat turns re-tokenized via the template usually don't
+   match strictly; see the rewind/SSM-snapshot note in server-context.cpp.
+   With multi-slot active, the server's default LRU slot selection can
+   route a follow-up turn to a different slot and miss the cache entirely;
+   `--slot-prompt-similarity` can help route by prefix overlap.
+3. TurboQuant V-cache not wired in — ggml-cuda/cpy.cu has no F32 → TQ3/
    TURBO* kernels so dflash's Q/K/V→KV copy can't use them.
+4. GPU compute still serializes on one CUDA device — two concurrent slots
+   time-share the same device. True parallel compute would require
+   multi-GPU shards or CUDA stream pipelining inside session_run.

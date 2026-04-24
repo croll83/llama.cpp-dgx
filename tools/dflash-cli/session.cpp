@@ -715,18 +715,33 @@ static bool build_draft_step(
 
 #include <cstring>
 
+// Shared weights handle. Holds target + draft on the backend; sessions
+// borrow a non-owning pointer. One weights handle can back many sessions
+// (one per llama-server slot) so a multi-slot server only pays the ~20 GiB
+// VRAM load once regardless of slot count.
+struct dflash_weights_s {
+    ggml_backend_t backend = nullptr;
+    TargetWeights  w;
+    DraftWeights   dw;
+};
+
 struct dflash_session_s {
     ggml_backend_t          backend;
-    TargetWeights           w;
-    DraftWeights            dw;
+    dflash_weights_t *      weights       = nullptr;  // non-owning if owns_weights=false
+    bool                    owns_weights  = false;    // legacy single-session create
     TargetCache             cache;
     StepGraph               sg;
     dflash_session_params_t params;
-    int                     max_ctx          = 0;
+    int                     max_ctx           = 0;
     int                     max_verify_tokens = 0;
-    int                     kv_end           = 0;
-    int32_t                 last_tok         = -1;
-    bool                    first_iter       = true;
+    int                     kv_end            = 0;
+    int32_t                 last_tok          = -1;
+    bool                    first_iter        = true;
+
+    // Per-session scratch for DDTree top-K extraction (was function-local
+    // `static` — unsafe across concurrent sessions).
+    std::vector<float>   ddtree_top_log_probs;
+    std::vector<int32_t> ddtree_top_token_ids;
 };
 
 extern "C" dflash_session_params_t dflash_session_default_params(void) {
@@ -742,32 +757,52 @@ extern "C" dflash_session_params_t dflash_session_default_params(void) {
     return p;
 }
 
-extern "C" dflash_session_t * dflash_session_create(const char * target_gguf,
-                                                     const char * draft_safetensors,
-                                                     const dflash_session_params_t * params_in,
-                                                     ggml_backend_t backend) {
-    auto * s = new dflash_session_s();
-    s->backend = backend;
-    s->params  = params_in ? *params_in : dflash_session_default_params();
+extern "C" dflash_weights_t * dflash_weights_load(const char * target_gguf,
+                                                   const char * draft_safetensors,
+                                                   ggml_backend_t backend) {
+    auto * ws = new dflash_weights_s();
+    ws->backend = backend;
+    if (!load_target_gguf(target_gguf, backend, ws->w)) {
+        delete ws; return nullptr;
+    }
+    if (!load_draft_safetensors(draft_safetensors, backend, ws->dw)) {
+        free_target_weights(ws->w);
+        delete ws; return nullptr;
+    }
+    return ws;
+}
 
+extern "C" void dflash_weights_free(dflash_weights_t * ws) {
+    if (!ws) return;
+    free_draft_weights(ws->dw);
+    free_target_weights(ws->w);
+    delete ws;
+}
+
+extern "C" dflash_session_t * dflash_session_create_shared(dflash_weights_t * weights,
+                                                            const dflash_session_params_t * params_in,
+                                                            ggml_backend_t backend) {
+    if (!weights) return nullptr;
+
+    auto * s = new dflash_session_s();
+    s->backend      = backend;
+    s->weights      = weights;
+    s->owns_weights = false;
+    s->params       = params_in ? *params_in : dflash_session_default_params();
+
+    // These globals are process-wide; first-wins is fine because all
+    // sessions in one server use the same params. Worth noting but not
+    // worth a per-session refactor right now.
     if (s->params.kv_tbq) g_kq_stride_pad = 256;
     if (s->params.max_ctx > 0) g_max_ctx_override = s->params.max_ctx;
-
-    if (!load_target_gguf(target_gguf, backend, s->w)) {
-        delete s; return nullptr;
-    }
-    if (!load_draft_safetensors(draft_safetensors, backend, s->dw)) {
-        delete s; return nullptr;
-    }
 
     s->max_ctx           = s->params.max_ctx > 0 ? s->params.max_ctx : 4096;
     s->max_verify_tokens = s->params.ddtree
         ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, s->params.ddtree_budget + 1)
         : DFLASH27B_DRAFT_BLOCK_SIZE;
 
-    if (!create_target_cache(s->w, s->max_ctx, s->max_verify_tokens, backend, s->cache)) {
-        free_target_weights(s->w);
-        free_draft_weights(s->dw);
+    if (!create_target_cache(weights->w, s->max_ctx, s->max_verify_tokens,
+                             backend, s->cache)) {
         delete s;
         return nullptr;
     }
@@ -778,12 +813,29 @@ extern "C" dflash_session_t * dflash_session_create(const char * target_gguf,
     return s;
 }
 
+extern "C" dflash_session_t * dflash_session_create(const char * target_gguf,
+                                                     const char * draft_safetensors,
+                                                     const dflash_session_params_t * params_in,
+                                                     ggml_backend_t backend) {
+    dflash_weights_t * ws = dflash_weights_load(target_gguf, draft_safetensors, backend);
+    if (!ws) return nullptr;
+
+    dflash_session_t * s = dflash_session_create_shared(ws, params_in, backend);
+    if (!s) {
+        dflash_weights_free(ws);
+        return nullptr;
+    }
+    s->owns_weights = true;
+    return s;
+}
+
 extern "C" void dflash_session_destroy(dflash_session_t * s) {
     if (!s) return;
     step_graph_destroy(s->sg);
     free_target_cache(s->cache);
-    free_draft_weights(s->dw);
-    free_target_weights(s->w);
+    if (s->owns_weights) {
+        dflash_weights_free(s->weights);
+    }
     delete s;
 }
 
@@ -792,7 +844,8 @@ extern "C" int dflash_session_reset(dflash_session_t * s) {
     step_graph_free(s->sg);
     s->sg = StepGraph{};
     free_target_cache(s->cache);
-    if (!create_target_cache(s->w, s->max_ctx, s->max_verify_tokens, s->backend, s->cache)) {
+    if (!create_target_cache(s->weights->w, s->max_ctx, s->max_verify_tokens,
+                             s->backend, s->cache)) {
         return -1;
     }
     s->kv_end     = 0;
@@ -830,8 +883,8 @@ extern "C" int dflash_session_run(dflash_session_t * s,
 
     // -- pasted main() body with locals bound to session fields follows --
     auto & backend = s->backend;
-    auto & w       = s->w;
-    auto & dw      = s->dw;
+    auto & w       = s->weights->w;
+    auto & dw      = s->weights->dw;
     auto & cache   = s->cache;
     auto & sg      = s->sg;
     const int max_ctx            = s->max_ctx;
@@ -1086,8 +1139,10 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         // we can skip the O(L*vocab) top-K extract entirely and just fill rank 0
         // from draft_tok. For larger budgets we need real top-K.
         const int ddtree_K = (ddtree_budget > q_len - 1) ? 8 : 1;
-        static std::vector<float>   ddtree_top_log_probs; // [L × K]
-        static std::vector<int32_t> ddtree_top_token_ids; // [L × K]
+        // Per-session buffers (promoted from function-local statics so two
+        // concurrent sessions don't stomp each other).
+        auto & ddtree_top_log_probs = s->ddtree_top_log_probs;
+        auto & ddtree_top_token_ids = s->ddtree_top_token_ids;
         if (ddtree_mode) {
             const int L = q_len - 1;
             if ((int)ddtree_top_log_probs.size() < L * ddtree_K) {

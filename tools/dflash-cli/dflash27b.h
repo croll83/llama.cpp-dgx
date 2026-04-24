@@ -50,10 +50,17 @@ const char * dflash27b_last_error(void);
 
 // ─── Session API (public) ─────────────────────────────────────────
 
-// Opaque session handle. Owns the target cache, draft weights, step graph
-// and all per-request scratch. Not thread-safe: callers must serialize
-// access around a single session instance.
+// Opaque session handle. Owns the target cache, step graph and all
+// per-request scratch. Weights are either owned (legacy single-session
+// create) or borrowed from a shared dflash_weights_t. Not thread-safe:
+// callers must serialize access around a single session instance.
 typedef struct dflash_session_s dflash_session_t;
+
+// Opaque shared-weights handle. Holds target GGUF + draft safetensors on
+// the GPU backend and can be shared across multiple sessions (e.g. one
+// per llama-server slot). The caller owns the lifetime: it must outlive
+// every session created from it and be released with dflash_weights_free.
+typedef struct dflash_weights_s dflash_weights_t;
 
 typedef struct {
     int   max_ctx;              // max tokens the target KV cache will hold
@@ -75,11 +82,32 @@ struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 
 // Create a session bound to the given target GGUF and draft safetensors
-// file. Returns NULL on error; use dflash27b_last_error() for details.
+// file. The session internally owns the weights and frees them on destroy.
+// Convenience wrapper over dflash_weights_load + dflash_session_create_shared;
+// prefer the shared form when building multi-slot servers to avoid loading
+// ~20 GiB of weights per slot.
+// Returns NULL on error; use dflash27b_last_error() for details.
 dflash_session_t * dflash_session_create(const char * target_gguf,
                                           const char * draft_safetensors,
                                           const dflash_session_params_t * params,
                                           ggml_backend_t backend);
+
+// Load target GGUF + draft safetensors once into backend-resident buffers
+// usable by many sessions. Returns NULL on error.
+dflash_weights_t * dflash_weights_load(const char * target_gguf,
+                                        const char * draft_safetensors,
+                                        ggml_backend_t backend);
+
+// Free shared weights. Sessions created from these weights must all be
+// destroyed first — it is a use-after-free otherwise.
+void dflash_weights_free(dflash_weights_t * w);
+
+// Create a session that borrows the given shared weights. The caller
+// retains ownership of `weights`; the session holds a non-owning pointer.
+// Returns NULL on error; the weights handle is unchanged on failure.
+dflash_session_t * dflash_session_create_shared(dflash_weights_t * weights,
+                                                 const dflash_session_params_t * params,
+                                                 ggml_backend_t backend);
 
 void dflash_session_destroy(dflash_session_t * s);
 

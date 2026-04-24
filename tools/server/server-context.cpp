@@ -63,6 +63,11 @@ struct server_slot {
 
     common_speculative * spec = nullptr;
 
+    // Per-slot DFlash session. Borrows shared weights from
+    // server_context_impl::dflash_weights; nullptr when --dflash is off.
+    // Freed in server_context_impl::destroy() before the shared weights.
+    dflash_session_t * dflash_session = nullptr;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -568,10 +573,14 @@ private:
 
     llama_model_ptr model_dft;
 
-    // DFlash session: owns target cache + draft weights + step graph.
-    // Created in load_model() when params_base.dflash is true.
-    // Shared across slots — current dflash MVP serializes requests.
-    dflash_session_t * dflash_session = nullptr;
+    // DFlash shared weights (target GGUF + draft safetensors on GPU).
+    // Loaded once in load_model() when params_base.dflash is true and then
+    // referenced by one dflash_session per slot. Freed in destroy() *after*
+    // every slot.dflash_session has been destroyed.
+    dflash_weights_t * dflash_weights = nullptr;
+    // CUDA backend handle used for DFlash weights + per-slot sessions. Owned
+    // by this context for the process lifetime; freed in destroy().
+    ggml_backend_t     dflash_backend = nullptr;
 
     bool add_bos_token = true;
 
@@ -599,9 +608,22 @@ private:
     bool sleeping = false;
 
     void destroy() {
-        if (dflash_session) {
-            dflash_session_destroy(dflash_session);
-            dflash_session = nullptr;
+        // Destroy per-slot DFlash sessions before freeing their shared
+        // weights. Session destroy also tears down gallocr / step graph /
+        // cache allocations that reference the same ggml backend.
+        for (server_slot & s : slots) {
+            if (s.dflash_session) {
+                dflash_session_destroy(s.dflash_session);
+                s.dflash_session = nullptr;
+            }
+        }
+        if (dflash_weights) {
+            dflash_weights_free(dflash_weights);
+            dflash_weights = nullptr;
+        }
+        if (dflash_backend) {
+            ggml_backend_free(dflash_backend);
+            dflash_backend = nullptr;
         }
         llama_init.reset();
         ctx = nullptr;
@@ -681,36 +703,28 @@ private:
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         // ── DFlash init ──
+        // Load shared weights once. Per-slot sessions are created later in
+        // the slot-init loop via dflash_session_create_shared.
         if (params_base.dflash) {
             if (params_base.dflash_draft.empty()) {
                 SRV_ERR("%s", "--dflash requires --dflash-draft <safetensors>\n");
                 return false;
             }
-            ggml_backend_t be = ggml_backend_cuda_init(0);
-            if (!be) {
+            dflash_backend = ggml_backend_cuda_init(0);
+            if (!dflash_backend) {
                 SRV_ERR("%s", "DFlash: ggml_backend_cuda_init failed\n");
                 return false;
             }
-            dflash_session_params_t dp = dflash_session_default_params();
-            dp.max_ctx           = params_base.dflash_max_ctx > 0
-                                       ? params_base.dflash_max_ctx
-                                       : (int) params_base.n_ctx;
-            dp.ddtree_budget     = params_base.dflash_budget;
-            dp.ddtree            = 1;
-            dp.fast_rollback     = 1;
-            dp.ddtree_chain_seed = 1;
-            dp.ddtree_temp       = 1.0f;
-            dp.kv_tbq            = 0;
-            dp.prefill_ubatch    = 0;
-            dflash_session = dflash_session_create(
+            dflash_weights = dflash_weights_load(
                 params_base.model.path.c_str(),
                 params_base.dflash_draft.c_str(),
-                &dp, be);
-            if (!dflash_session) {
-                SRV_ERR("DFlash: session_create failed: %s\n", dflash27b_last_error());
+                dflash_backend);
+            if (!dflash_weights) {
+                SRV_ERR("DFlash: weights_load failed: %s\n", dflash27b_last_error());
                 return false;
             }
-            SRV_INF("DFlash session ready (budget=%d, max_ctx=%d)\n", dp.ddtree_budget, dp.max_ctx);
+            SRV_INF("DFlash weights loaded (shared across %d slot%s)\n",
+                    params_base.n_parallel, params_base.n_parallel == 1 ? "" : "s");
         }
 
 
@@ -860,6 +874,33 @@ private:
             };
 
             slot.reset();
+
+            // Per-slot DFlash session. All slots share the same target +
+            // draft weights (see load_model()) but keep their own KV cache,
+            // SSM state and step graph so two concurrent slots don't stomp
+            // each other's decode state.
+            if (params_base.dflash && dflash_weights) {
+                dflash_session_params_t dp = dflash_session_default_params();
+                dp.max_ctx           = params_base.dflash_max_ctx > 0
+                                           ? params_base.dflash_max_ctx
+                                           : (int) params_base.n_ctx;
+                dp.ddtree_budget     = params_base.dflash_budget;
+                dp.ddtree            = 1;
+                dp.fast_rollback     = 1;
+                dp.ddtree_chain_seed = 1;
+                dp.ddtree_temp       = 1.0f;
+                dp.kv_tbq            = 0;
+                dp.prefill_ubatch    = 0;
+                slot.dflash_session = dflash_session_create_shared(
+                    dflash_weights, &dp, dflash_backend);
+                if (!slot.dflash_session) {
+                    SRV_ERR("DFlash: session_create_shared failed for slot %d: %s\n",
+                            i, dflash27b_last_error());
+                    return false;
+                }
+                SLT_INF(slot, "DFlash session ready (budget=%d, max_ctx=%d)\n",
+                        dp.ddtree_budget, dp.max_ctx);
+            }
 
             slots.push_back(std::move(slot));
         }
@@ -2057,7 +2098,7 @@ private:
     }
 
     void update_slots() {
-        if (dflash_session) { update_slots_dflash(); return; }
+        if (dflash_weights) { update_slots_dflash(); return; }
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -3158,8 +3199,14 @@ private:
 
         SRV_INF("DFlash run: slot=%d prompt=%d lcp=%d append=%d n_gen=%d\n", slot.id, n_prompt, lcp, append_mode, n_gen);
 
+        if (!slot.dflash_session) {
+            send_error(slot, "DFlash: slot has no session (init failure?)", ERROR_TYPE_SERVER);
+            slot.release();
+            return;
+        }
+
         int n_out = dflash_session_run(
-            dflash_session,
+            slot.dflash_session,
             delta_ids.empty() ? nullptr : delta_ids.data(),
             (int) delta_ids.size(),
             n_gen, append_mode,
