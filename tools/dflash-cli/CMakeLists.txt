@@ -31,10 +31,14 @@ add_library(${TARGET_LIB} STATIC
 
 target_include_directories(${TARGET_LIB}
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
+    # Borrow path needs internal llama-model.h + llama-hparams.h (and the
+    # public llama.h they include). Include both src/ and include/.
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include
 )
 
 target_link_libraries(${TARGET_LIB}
     PUBLIC ggml ggml-cuda ggml-base CUDA::cudart
+    PRIVATE llama
 )
 
 # Soften the warning-as-error policy for these ported sources; they were

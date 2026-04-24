@@ -44,6 +44,10 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "../../src/llama-model.h"
+#include "../../src/llama-hparams.h"
+
+#include <unordered_map>
 
 #include <cinttypes>
 #include <cstdint>
@@ -449,13 +453,199 @@ bool load_target_gguf(const std::string & path,
 }
 
 void free_target_weights(TargetWeights & w) {
-    if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
-    if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
-    // CpuEmbedder destructor handles the mmap automatically.
+    // When borrowed, the underlying buffer/ctx live in the host llama_model;
+    // we only own the layer pointer vector.
+    if (!w.borrowed) {
+        if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
+        if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
+    }
+    // CpuEmbedder destructor handles the mmap automatically (no-op when
+    // borrowed, since we never opened a separate mmap in that path).
     w.layers.clear();
     w.tok_embd = nullptr;
     w.out_norm = nullptr;
     w.output   = nullptr;
+}
+
+bool load_target_from_llama_model(const ::llama_model * lm,
+                                  const std::string & gguf_path,
+                                  ggml_backend_t      backend,
+                                  TargetWeights &     out) {
+    if (!lm) { set_last_error("llama_model is null"); return false; }
+
+    // Build a name -> tensor map from the host llama_model.
+    std::unordered_map<std::string, ggml_tensor *> tmap;
+    {
+        const auto & v = llama_internal_get_tensor_map(lm);
+        tmap.reserve(v.size());
+        for (const auto & [name, t] : v) tmap[name] = t;
+    }
+    auto fnd = [&](const std::string & name) -> ggml_tensor * {
+        auto it = tmap.find(name);
+        return it == tmap.end() ? nullptr : it->second;
+    };
+
+    out.borrowed = true;
+    out.backend  = backend;
+    out.ctx      = nullptr;
+    out.buf      = nullptr;
+
+    // Pull metadata from llama_hparams. The host already validated these
+    // against the GGUF on its own load path, so we just mirror them here.
+    out.n_layer       = (int) lm->hparams.n_layer;
+    out.n_embd        = (int) lm->hparams.n_embd;
+    out.n_ff          = (int) lm->hparams.n_ff(0);
+    out.n_head        = (int) lm->hparams.n_head(0);
+    out.n_head_kv     = (int) lm->hparams.n_head_kv(0);
+    out.n_embd_head_k = (int) lm->hparams.n_embd_head_k(0);
+    out.n_embd_head_v = (int) lm->hparams.n_embd_head_v(0);
+    out.full_attention_interval = 4;  // qwen35 default
+    out.ssm_d_conv    = 4;
+    out.ssm_d_inner   = 6144;
+    out.ssm_d_state   = 128;
+    out.ssm_dt_rank   = 48;
+    out.ssm_n_group   = 16;
+
+    out.tok_embd = fnd("token_embd.weight");
+    out.out_norm = fnd("output_norm.weight");
+    out.output   = fnd("output.weight");
+    out.output_s = fnd("output.scale");
+    if (!out.tok_embd || !out.out_norm || !out.output) {
+        set_last_error("borrow: missing top-level tensors");
+        return false;
+    }
+
+    out.layers.assign((size_t) out.n_layer, TargetLayer{});
+    for (int il = 0; il < out.n_layer; il++) {
+        char namebuf[128];
+        auto layer_fnd = [&](const char * suffix) -> ggml_tensor * {
+            std::snprintf(namebuf, sizeof(namebuf), "blk.%d.%s", il, suffix);
+            return fnd(namebuf);
+        };
+        TargetLayer & L = out.layers[il];
+
+        L.attn_norm      = layer_fnd("attn_norm.weight");
+        L.attn_post_norm = layer_fnd("post_attention_norm.weight");
+        L.w_gate         = layer_fnd("ffn_gate.weight");
+        L.w_up           = layer_fnd("ffn_up.weight");
+        L.w_down         = layer_fnd("ffn_down.weight");
+
+        L.wq     = layer_fnd("attn_q.weight");
+        L.wk     = layer_fnd("attn_k.weight");
+        L.wv     = layer_fnd("attn_v.weight");
+        L.wo     = layer_fnd("attn_output.weight");
+        L.q_norm = layer_fnd("attn_q_norm.weight");
+        L.k_norm = layer_fnd("attn_k_norm.weight");
+
+        L.wqkv         = layer_fnd("attn_qkv.weight");
+        L.wqkv_gate    = layer_fnd("attn_gate.weight");
+        L.ssm_conv1d   = layer_fnd("ssm_conv1d.weight");
+        L.ssm_beta     = layer_fnd("ssm_beta.weight");
+        L.ssm_alpha    = layer_fnd("ssm_alpha.weight");
+        L.ssm_a        = layer_fnd("ssm_a");
+        L.ssm_dt_bias  = layer_fnd("ssm_dt.bias");
+        L.ssm_norm     = layer_fnd("ssm_norm.weight");
+        L.ssm_out      = layer_fnd("ssm_out.weight");
+
+        // NVFP4 per-tensor scale2 (null on non-NVFP4 quantizations)
+        L.w_gate_s     = layer_fnd("ffn_gate.scale");
+        L.w_up_s       = layer_fnd("ffn_up.scale");
+        L.w_down_s     = layer_fnd("ffn_down.scale");
+        L.wq_s         = layer_fnd("attn_q.scale");
+        L.wk_s         = layer_fnd("attn_k.scale");
+        L.wv_s         = layer_fnd("attn_v.scale");
+        L.wo_s         = layer_fnd("attn_output.scale");
+        L.wqkv_s       = layer_fnd("attn_qkv.scale");
+        L.wqkv_gate_s  = layer_fnd("attn_gate.scale");
+        L.ssm_beta_s   = layer_fnd("ssm_beta.scale");
+        L.ssm_alpha_s  = layer_fnd("ssm_alpha.scale");
+        L.ssm_out_s    = layer_fnd("ssm_out.scale");
+
+        const bool is_full_attn_layer = (((il + 1) % out.full_attention_interval) == 0);
+        const bool has_attn = L.wq && L.wk && L.wv && L.wo;
+        const bool has_ssm  = L.wqkv && L.wqkv_gate && L.ssm_conv1d && L.ssm_out;
+        if (is_full_attn_layer && !has_attn) {
+            char b[128];
+            std::snprintf(b, sizeof(b), "borrow: layer %d missing full-attn tensors", il);
+            set_last_error(b);
+            return false;
+        }
+        if (!is_full_attn_layer && !has_ssm) {
+            char b[128];
+            std::snprintf(b, sizeof(b), "borrow: layer %d missing deltanet tensors", il);
+            set_last_error(b);
+            return false;
+        }
+    }
+
+    // CpuEmbedder: borrow the host's tok_embd if it lives on a host buffer
+    // (CPU-mapped, the typical case when the model was loaded with mmap and
+    // the embedding table stayed on CPU). Otherwise fall back to mmap'ing
+    // the GGUF separately so we can dequantize rows on demand.
+    out.embedder = CpuEmbedder{};
+    bool cpu_embed_set = false;
+    if (out.tok_embd && out.tok_embd->buffer &&
+        ggml_backend_buffer_is_host(out.tok_embd->buffer)) {
+        out.embedder.tok_embd_bytes = (const uint8_t *) ggml_get_data(out.tok_embd);
+        out.embedder.tok_embd_type  = out.tok_embd->type;
+        out.embedder.n_embd         = out.n_embd;
+        out.embedder.n_vocab        = (int) out.tok_embd->ne[1];
+        out.embedder.row_bytes      = ggml_row_size(out.tok_embd->type, out.n_embd);
+        cpu_embed_set = (out.embedder.tok_embd_bytes != nullptr);
+    }
+    if (!cpu_embed_set) {
+        if (gguf_path.empty()) {
+            set_last_error("borrow: tok_embd not on host buffer and no gguf_path provided");
+            return false;
+        }
+        // Re-mmap the GGUF and find tok_embd offset (lightweight; only metadata).
+        gguf_init_params gp{};
+        gp.no_alloc = true;
+        gp.ctx      = nullptr;
+        struct gguf_context * gctx = gguf_init_from_file(gguf_path.c_str(), gp);
+        if (!gctx) {
+            set_last_error("borrow: failed to open gguf for tok_embd mmap");
+            return false;
+        }
+        int64_t tok_id = -1;
+        for (int64_t tid = 0; tid < gguf_get_n_tensors(gctx); tid++) {
+            if (std::string(gguf_get_tensor_name(gctx, tid)) == "token_embd.weight") { tok_id = tid; break; }
+        }
+        if (tok_id < 0) { gguf_free(gctx); set_last_error("borrow: token_embd.weight not in gguf"); return false; }
+        const size_t off = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tok_id);
+        const size_t sz  = gguf_get_tensor_size(gctx, tok_id);
+        const ggml_type ty = gguf_get_tensor_type(gctx, tok_id);
+        gguf_free(gctx);
+        Mmap mm; std::string err;
+        if (!mm.open_ro(gguf_path, err)) { set_last_error(err); return false; }
+        out.embedder.mmap_addr      = mm.addr;
+        out.embedder.mmap_len       = mm.len;
+#if defined(_WIN32)
+        out.embedder.mmap_hfile     = mm.hFile;
+        out.embedder.mmap_hmap      = mm.hMap;
+#else
+        out.embedder.mmap_fd        = mm.fd;
+#endif
+        out.embedder.tok_embd_bytes = (const uint8_t *) mm.addr + off;
+        out.embedder.tok_embd_type  = ty;
+        out.embedder.n_embd         = out.n_embd;
+        out.embedder.n_vocab        = (int) out.tok_embd->ne[1];
+        out.embedder.row_bytes      = ggml_row_size(ty, out.n_embd);
+        // Mmap ownership transferred — clear locals so destructor doesnt close.
+        mm.addr = nullptr;
+#if !defined(_WIN32)
+        mm.fd = -1;
+#endif
+        (void) sz;
+    }
+
+    char summary[160];
+    std::snprintf(summary, sizeof(summary),
+        "target borrowed from llama_model: 0 GiB on GPU (shared), tok_embd %s",
+        cpu_embed_set ? "borrowed CPU" : "mmapped GGUF");
+    set_last_error(summary);
+
+    return true;
 }
 
 } // namespace dflash27b

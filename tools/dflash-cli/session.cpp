@@ -843,6 +843,24 @@ extern "C" dflash_weights_t * dflash_weights_load(const char * target_gguf,
     return ws;
 }
 
+extern "C" dflash_weights_t * dflash_weights_load_borrow(const struct llama_model * lm,
+                                                          const char * target_gguf_path,
+                                                          const char * draft_safetensors,
+                                                          ggml_backend_t backend) {
+    if (!lm) { set_last_error("dflash_weights_load_borrow: llama_model is null"); return nullptr; }
+    auto * ws = new dflash_weights_s();
+    ws->backend = backend;
+    std::string path = target_gguf_path ? target_gguf_path : "";
+    if (!load_target_from_llama_model(lm, path, backend, ws->w)) {
+        delete ws; return nullptr;
+    }
+    if (!load_draft_safetensors(draft_safetensors, backend, ws->dw)) {
+        free_target_weights(ws->w);
+        delete ws; return nullptr;
+    }
+    return ws;
+}
+
 extern "C" void dflash_weights_free(dflash_weights_t * ws) {
     if (!ws) return;
     free_draft_weights(ws->dw);

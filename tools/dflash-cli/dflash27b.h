@@ -98,6 +98,21 @@ dflash_weights_t * dflash_weights_load(const char * target_gguf,
                                         const char * draft_safetensors,
                                         ggml_backend_t backend);
 
+// Borrow target weights from an already-loaded llama_model — saves ~15 GB
+// on GPU vs dflash_weights_load when llama-server keeps a resident model
+// for mmproj support. The draft is still loaded normally from
+// . The caller must keep the host llama_model alive for
+// as long as the returned dflash_weights_t is in use; freeing the weights
+// does NOT free the host model.
+//
+//  may be empty if the host llama_model already keeps
+// tok_embd on a host (CPU-mapped) buffer; otherwise it is used to mmap the
+// embedding rows for the CpuEmbedder.
+dflash_weights_t * dflash_weights_load_borrow(const struct llama_model * lm,
+                                               const char * target_gguf_path,
+                                               const char * draft_safetensors,
+                                               ggml_backend_t backend);
+
 // Free shared weights. Sessions created from these weights must all be
 // destroyed first — it is a use-after-free otherwise.
 void dflash_weights_free(dflash_weights_t * w);

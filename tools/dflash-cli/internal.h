@@ -120,6 +120,13 @@ struct TargetWeights {
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
+    // True when weights point into an externally-owned llama_model: skip
+    // ggml_backend_buffer_free / ggml_free in free_target_weights since the
+    // host owns the lifetime. Used by load_target_from_llama_model to avoid
+    // duplicating the ~15 GB target on GPU when llama-server already keeps a
+    // resident llama_model around for mmproj support.
+    bool                  borrowed = false;
+
     // CPU-side embedding table (zero GPU cost).
     CpuEmbedder           embedder;
 
@@ -151,6 +158,16 @@ struct TargetWeights {
 bool load_target_gguf(const std::string & path,
                       ggml_backend_t backend,
                       TargetWeights & out);
+
+// Borrow target weights from an already-loaded llama_model. Saves ~15 GB
+// on GPU vs load_target_gguf when llama-server keeps a resident model for
+// mmproj. "gguf_path" is used only for the CpuEmbedder tok_embd mmap;
+// pass empty to fall back to reading bytes via ggml_backend_tensor_get
+// from the llama_model copy.
+bool load_target_from_llama_model(const ::llama_model *      lm,
+                                  const std::string &        gguf_path,
+                                  ggml_backend_t             backend,
+                                  TargetWeights &            out);
 
 void free_target_weights(TargetWeights & w);
 

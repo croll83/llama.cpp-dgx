@@ -724,16 +724,35 @@ private:
                 SRV_ERR("%s", "DFlash: ggml_backend_cuda_init failed\n");
                 return false;
             }
-            dflash_weights = dflash_weights_load(
-                params_base.model.path.c_str(),
-                params_base.dflash_draft.c_str(),
-                dflash_backend);
-            if (!dflash_weights) {
-                SRV_ERR("DFlash: weights_load failed: %s\n", dflash27b_last_error());
-                return false;
+            // Borrow target weights from the resident llama_model when mmproj
+            // forces vocab_only_model=false (we already keep ~15 GB on GPU for
+            // the host model — re-loading via gguf_target_loader would double
+            // that). Fall back to the standalone load path otherwise.
+            const bool can_borrow = !params_base.mmproj.path.empty() && model != nullptr;
+            if (can_borrow) {
+                dflash_weights = dflash_weights_load_borrow(
+                    model,
+                    params_base.model.path.c_str(),
+                    params_base.dflash_draft.c_str(),
+                    dflash_backend);
+                if (!dflash_weights) {
+                    SRV_ERR("DFlash: weights_load_borrow failed: %s\n", dflash27b_last_error());
+                    return false;
+                }
+                SRV_INF("DFlash weights borrowed from llama_model (saves ~15 GB) (shared across %d slot%s)\n",
+                        params_base.n_parallel, params_base.n_parallel == 1 ? "" : "s");
+            } else {
+                dflash_weights = dflash_weights_load(
+                    params_base.model.path.c_str(),
+                    params_base.dflash_draft.c_str(),
+                    dflash_backend);
+                if (!dflash_weights) {
+                    SRV_ERR("DFlash: weights_load failed: %s\n", dflash27b_last_error());
+                    return false;
+                }
+                SRV_INF("DFlash weights loaded (shared across %d slot%s)\n",
+                        params_base.n_parallel, params_base.n_parallel == 1 ? "" : "s");
             }
-            SRV_INF("DFlash weights loaded (shared across %d slot%s)\n",
-                    params_base.n_parallel, params_base.n_parallel == 1 ? "" : "s");
         }
 
 
