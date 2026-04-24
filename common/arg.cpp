@@ -2363,6 +2363,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.dflash_max_ctx = value > 0 ? value : 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_MAX_CTX"));
+    add_opt(common_arg(
+        {"--dflash-temp"}, "F",
+        "softmax temperature for DDtree top-K draft extraction (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            params.dflash_temp = v > 0.0f ? v : 1.0f;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TEMP"));
+    add_opt(common_arg(
+        {"--dflash-kv-tbq"},
+        "align DFlash KV mask stride to 256 (required when using TurboQuant FA kernels)",
+        [](common_params & params) {
+            params.dflash_kv_tbq = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_KV_TBQ"));
+    add_opt(common_arg(
+        {"--dflash-prefill-ubatch"}, "N",
+        "DFlash prefill micro-batch size (default: auto — 16 for <=2048 prompts, 192 otherwise)",
+        [](common_params & params, int value) {
+            params.dflash_prefill_ubatch = value > 0 ? value : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_PREFILL_UBATCH"));
 
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(

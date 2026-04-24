@@ -888,9 +888,9 @@ private:
                 dp.ddtree            = 1;
                 dp.fast_rollback     = 1;
                 dp.ddtree_chain_seed = 1;
-                dp.ddtree_temp       = 1.0f;
-                dp.kv_tbq            = 0;
-                dp.prefill_ubatch    = 0;
+                dp.ddtree_temp       = params_base.dflash_temp;
+                dp.kv_tbq            = params_base.dflash_kv_tbq ? 1 : 0;
+                dp.prefill_ubatch    = params_base.dflash_prefill_ubatch;
                 slot.dflash_session = dflash_session_create_shared(
                     dflash_weights, &dp, dflash_backend);
                 if (!slot.dflash_session) {

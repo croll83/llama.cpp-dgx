@@ -471,6 +471,9 @@ struct common_params {
     std::string dflash_draft;                 // path to draft safetensors
     int         dflash_budget      = 22;      // DDtree node budget
     int         dflash_max_ctx     = 0;       // 0 = use common_params.n_ctx
+    float       dflash_temp        = 1.0f;    // softmax temp for ddtree top-K
+    bool        dflash_kv_tbq      = false;   // 1 = align mask stride to 256 (TBQ FA)
+    int         dflash_prefill_ubatch = 0;    // 0 = auto (16 if <=2048, 192 else)
 
     struct common_params_model model;
 
