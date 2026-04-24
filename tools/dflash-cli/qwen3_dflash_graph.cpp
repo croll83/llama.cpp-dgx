@@ -117,9 +117,15 @@ DraftGraphOutputs build_draft_graph(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [head_dim, total_k,  n_kv,   1]
         V = ggml_cont   (ctx, V);
 
-        // ── 2f. Non-causal flash attention; GQA broadcast handled internally.
+        // ── 2f. Flash attention. When the draft is non-causal (Qwen3.5 era)
+        //        both masks are null and flash_attn runs non-causal. When the
+        //        draft ships with SWA (Qwen3.6), SWA layers receive the
+        //        causal+windowed mask while full-attention layers receive the
+        //        causal-only mask. GQA broadcast is handled internally by ggml.
+        const bool    layer_swa = in.layer_is_swa ? (*in.layer_is_swa)[il] : false;
+        ggml_tensor * layer_mask = layer_swa ? in.attn_mask_swa : in.attn_mask_full;
         const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, /*mask=*/nullptr,
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, layer_mask,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
         // attn result: [n_embd_v=head_dim, n_head, n_batch=q_len, 1]

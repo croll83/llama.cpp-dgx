@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
@@ -439,6 +440,84 @@ bool load_draft_safetensors(const std::string & path,
             return false;
         }
     }
+
+    // Try sibling config.json for sliding_window / use_sliding_window.
+    // Qwen3.6-27B-DFlash ships with  + 
+    // plus . The older Qwen3.5 draft has
+    // neither, so swa_window stays 0 and the graph keeps its non-causal path.
+    out.swa_window = 0;
+    {
+        size_t slash = path.find_last_of("/\\");
+        std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+        std::string cfg_path = dir + "/config.json";
+        FILE * f = std::fopen(cfg_path.c_str(), "rb");
+        if (f) {
+            std::fseek(f, 0, SEEK_END);
+            long fsz = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (fsz > 0 && fsz < 1 * 1024 * 1024) {
+                std::string cfg((size_t) fsz, '\0');
+                size_t nr = std::fread(&cfg[0], 1, (size_t) fsz, f);
+                cfg.resize(nr);
+                auto find_bool = [&](const char * key) -> int {
+                    std::string needle = std::string("\"") + key + "\"";
+                    size_t i = cfg.find(needle);
+                    if (i == std::string::npos) return -1;
+                    i = cfg.find(":", i);
+                    if (i == std::string::npos) return -1;
+                    // skip whitespace
+                    while (i + 1 < cfg.size() && std::isspace((unsigned char) cfg[i + 1])) i++;
+                    if (cfg.compare(i + 1, 4, "true") == 0) return 1;
+                    if (cfg.compare(i + 1, 5, "false") == 0) return 0;
+                    return -1;
+                };
+                auto find_int = [&](const char * key) -> long {
+                    std::string needle = std::string("\"") + key + "\"";
+                    size_t i = cfg.find(needle);
+                    if (i == std::string::npos) return -1;
+                    i = cfg.find(":", i);
+                    if (i == std::string::npos) return -1;
+                    char * endp = nullptr;
+                    long v = std::strtol(cfg.c_str() + i + 1, &endp, 10);
+                    if (endp == cfg.c_str() + i + 1) return -1;
+                    return v;
+                };
+                int use_swa = find_bool("use_sliding_window");
+                long win    = find_int("sliding_window");
+                if (use_swa == 1 && win > 0) {
+                    out.swa_window = (int) win;
+
+                    // Parse the per-layer "layer_types" array. We look for
+                    // either "sliding_attention" (SWA) or "full_attention"
+                    // (full causal), matching the Qwen3 config convention.
+                    size_t lt = cfg.find("\"layer_types\"");
+                    if (lt != std::string::npos) {
+                        size_t lb = cfg.find("[", lt);
+                        size_t rb = cfg.find("]", lt);
+                        if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
+                            std::string arr = cfg.substr(lb + 1, rb - lb - 1);
+                            size_t pos = 0;
+                            while (pos < arr.size()) {
+                                size_t q0 = arr.find("\"", pos);
+                                if (q0 == std::string::npos) break;
+                                size_t q1 = arr.find("\"", q0 + 1);
+                                if (q1 == std::string::npos) break;
+                                std::string ty = arr.substr(q0 + 1, q1 - q0 - 1);
+                                out.layer_is_swa.push_back(ty == "sliding_attention");
+                                pos = q1 + 1;
+                            }
+                        }
+                    }
+                    // Fallback: all layers SWA if the per-layer list was absent.
+                    if (out.layer_is_swa.empty() && !out.layers.empty()) {
+                        out.layer_is_swa.assign(out.layers.size(), true);
+                    }
+                }
+            }
+            std::fclose(f);
+        }
+    }
+    std::fprintf(stderr, "draft: swa_window = %d (0 = non-causal)\n", out.swa_window);
 
     return true;
 }

@@ -128,6 +128,55 @@ static void build_causal_mask(std::vector<uint16_t> & out,
     }
 }
 
+// Causal sliding-window mask for the DFlash draft attention, used when the
+// draft model declares a non-zero sliding_window in its config.json
+// (Qwen3.6-27B-DFlash). The draft packs K as concat(K_ctx, K_noise), so
+// Q position i corresponds to token position (ctx_len + i) and K position k
+// corresponds to token position k for k in [0, ctx_len+q_len).
+//
+// Mask semantics per (q, k):
+//   - causal:  allow only k <= ctx_len+q
+//   - window:  allow only (ctx_len+q - k) < swa_window
+//
+// Uses the same padded 2D [kv_pad, q_pad] layout as build_causal_mask above
+// so it can be consumed by ggml_flash_attn_ext on the CUDA backend.
+// Full-causal mask (no window) for the draft's full-attention layers
+// (Qwen3.6-27B-DFlash ships with the last layer as full_attention). Same
+// padded [kv_pad, q_pad] layout as the SWA variant so they can be swapped
+// per layer inside the draft graph builder.
+static void build_draft_causal_full_mask(std::vector<uint16_t> & out,
+                                         int ctx_len, int q_len) {
+    const int total_k = ctx_len + q_len;
+    const int kv_pad  = align_up(total_k, g_kq_stride_pad);
+    const int q_pad   = align_up(q_len, KQ_MASK_PAD);
+    out.assign((size_t) kv_pad * q_pad, F16_NEG_INF);
+    for (int q = 0; q < q_len; q++) {
+        const int p_q = ctx_len + q;
+        const int k_to = p_q < total_k ? p_q : (total_k - 1);
+        for (int k = 0; k <= k_to; k++) {
+            out[(size_t) q * kv_pad + k] = F16_ZERO;
+        }
+    }
+}
+
+static void build_draft_causal_swa_mask(std::vector<uint16_t> & out,
+                                        int ctx_len, int q_len, int swa_window) {
+    const int total_k = ctx_len + q_len;
+    const int kv_pad  = align_up(total_k, g_kq_stride_pad);
+    const int q_pad   = align_up(q_len, KQ_MASK_PAD);
+    out.assign((size_t) kv_pad * q_pad, F16_NEG_INF);
+    for (int q = 0; q < q_len; q++) {
+        const int p_q    = ctx_len + q;
+        const int k_hi   = p_q;                                  // causal: k <= p_q
+        const int k_lo   = p_q - (swa_window - 1);               // window: p_q - k < swa_window
+        const int k_from = k_lo > 0 ? k_lo : 0;
+        const int k_to   = k_hi < total_k ? k_hi : (total_k - 1);
+        for (int k = k_from; k <= k_to; k++) {
+            out[(size_t) q * kv_pad + k] = F16_ZERO;
+        }
+    }
+}
+
 // ─── DDTree support (ported from liranringel/ddtree/ddtree.py) ────────
 
 // Per-position top-K softmax extraction. Computes log-probabilities (needed
@@ -683,6 +732,22 @@ static bool build_draft_step(
     ggml_set_name(sg.positions_k, "positions_k");
     ggml_set_input(sg.positions_k);
 
+    // Causal SWA + full-causal masks for Qwen3.6-27B-DFlash draft. Both are
+    // [kv_pad, q_pad] F16 with values 0/-INF. Skipped entirely when the draft
+    // is non-causal (old Qwen3.5 draft, dw.swa_window == 0).
+    sg.attn_mask      = nullptr;   // re-used as attn_mask_swa (legacy field)
+    ggml_tensor * sg_attn_mask_full = nullptr;
+    if (dw.swa_window > 0) {
+        const int kv_pad = align_up(ctx_len + q_len, g_kq_stride_pad);
+        const int q_pad  = align_up(q_len, KQ_MASK_PAD);
+        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+        ggml_set_name(sg.attn_mask, "draft_attn_mask_swa");
+        ggml_set_input(sg.attn_mask);
+        sg_attn_mask_full = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+        ggml_set_name(sg_attn_mask_full, "draft_attn_mask_full");
+        ggml_set_input(sg_attn_mask_full);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 4096, false);
 
     DraftGraphInputs gi{};
@@ -691,7 +756,10 @@ static bool build_draft_step(
     gi.target_hidden_cat = sg.target_hidden_cat;
     gi.positions_q       = sg.positions;
     gi.positions_k       = sg.positions_k;
-    gi.lm_head           = tw.output;     // project through target.output (q6_K)
+    gi.attn_mask_swa     = sg.attn_mask;            // null when non-causal
+    gi.attn_mask_full    = sg_attn_mask_full;       // null when non-causal
+    gi.layer_is_swa      = dw.swa_window > 0 ? &dw.layer_is_swa : nullptr;
+    gi.lm_head           = tw.output;               // project through target.output (q6_K)
     DraftGraphOutputs go = build_draft_graph(sg.ctx, dw, gi);
     if (!go.logits) {
         std::fprintf(stderr, "draft graph missing logits (lm_head was null?)\n");
@@ -1255,6 +1323,20 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf[i] = i;
         ggml_backend_tensor_set(sg.positions,   pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
         ggml_backend_tensor_set(sg.positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
+
+        // Draft mask upload for Qwen3.6-27B-DFlash (both swa + full-causal);
+        // skipped when non-causal (Qwen3.5 draft, swa_window == 0).
+        if (sg.attn_mask && dw.swa_window > 0) {
+            ggml_tensor * mask_full = ggml_get_tensor(sg.ctx, "draft_attn_mask_full");
+            build_draft_causal_swa_mask(mask_buf, draft_ctx, q_len, dw.swa_window);
+            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                    sizeof(uint16_t) * mask_buf.size());
+            if (mask_full) {
+                build_draft_causal_full_mask(mask_buf, draft_ctx, q_len);
+                ggml_backend_tensor_set(mask_full, mask_buf.data(), 0,
+                                        sizeof(uint16_t) * mask_buf.size());
+            }
+        }
         auto T_draft_set = sync_us();
         tt_draft_set += std::chrono::duration<double, std::micro>(T_draft_set - T_draft_copy).count();
 

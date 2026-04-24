@@ -175,6 +175,11 @@ public:
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
+    // true iff this server_tokens instance actually carries image/audio chunks
+    // (as opposed to the slot-level has_mtmd capability flag, which is true
+    // whenever --mmproj is loaded, regardless of the current request content)
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data

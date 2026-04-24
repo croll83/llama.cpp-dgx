@@ -330,10 +330,14 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
+    if (L.w_gate_s) gate = ggml_mul(ctx, gate, L.w_gate_s);  // NVFP4 scale2
     gate = ggml_silu(ctx, gate);
     ggml_tensor * up = ggml_mul_mat(ctx, L.w_up, cur);
+    if (L.w_up_s) up = ggml_mul(ctx, up, L.w_up_s);          // NVFP4 scale2
     ggml_tensor * gu = ggml_mul(ctx, gate, up);
-    return ggml_mul_mat(ctx, L.w_down, gu);                  // [hidden, n_tokens]
+    ggml_tensor * down = ggml_mul_mat(ctx, L.w_down, gu);    // [hidden, n_tokens]
+    if (L.w_down_s) down = ggml_mul(ctx, down, L.w_down_s);  // NVFP4 scale2
+    return down;
 }
 
 // Full-attention block (matches llama.cpp's build_layer_attn for qwen35)
@@ -357,6 +361,7 @@ static ggml_tensor * build_full_attn_block(
 ) {
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
+    if (L.wq_s) QG = ggml_mul(ctx, QG, L.wq_s);
     // Reshape to [head_dim*2, n_head, n_tokens] so we can view the Q and gate halves
     QG = ggml_reshape_3d(ctx, QG, q35::HEAD_DIM * 2, q35::N_HEAD, n_tokens);
 
@@ -379,7 +384,9 @@ static ggml_tensor * build_full_attn_block(
 
     // ── K and V projections
     ggml_tensor * Kcur = ggml_mul_mat(ctx, L.wk, cur);   // [kv_dim, n_tokens]
+    if (L.wk_s) Kcur = ggml_mul(ctx, Kcur, L.wk_s);
     ggml_tensor * Vcur = ggml_mul_mat(ctx, L.wv, cur);   // [kv_dim, n_tokens]
+    if (L.wv_s) Vcur = ggml_mul(ctx, Vcur, L.wv_s);
 
     Kcur = ggml_reshape_3d(ctx, Kcur, q35::HEAD_DIM, q35::N_HEAD_KV, n_tokens);
     Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, q35::EPS);
@@ -466,6 +473,7 @@ static ggml_tensor * build_full_attn_block(
 
     // ── Output projection
     attn = ggml_mul_mat(ctx, L.wo, attn);  // [hidden, n_tokens]
+    if (L.wo_s) attn = ggml_mul(ctx, attn, L.wo_s);
     return attn;
 }
 
@@ -500,13 +508,16 @@ static ggml_tensor * build_delta_net_block(
 
     // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
     ggml_tensor * qkv_mixed = ggml_mul_mat(ctx, L.wqkv, cur);
+    if (L.wqkv_s) qkv_mixed = ggml_mul(ctx, qkv_mixed, L.wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, q35::CONV_CHANNELS, n_seq_tokens, n_seqs);
 
     // ── z = wqkv_gate @ cur            [inner, n_tokens]
     ggml_tensor * z = ggml_mul_mat(ctx, L.wqkv_gate, cur);
+    if (L.wqkv_gate_s) z = ggml_mul(ctx, z, L.wqkv_gate_s);
 
     // ── beta = ssm_beta @ cur          [dt_rank, n_tokens]
     ggml_tensor * beta = ggml_mul_mat(ctx, L.ssm_beta, cur);
+    if (L.ssm_beta_s) beta = ggml_mul(ctx, beta, L.ssm_beta_s);
     beta = ggml_reshape_4d(ctx, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     beta = ggml_sigmoid(ctx, beta);
 
@@ -515,6 +526,7 @@ static ggml_tensor * build_delta_net_block(
     //    alpha = softplus(alpha)
     //    g     = alpha * ssm_a                (-A_log.exp() * softplus)
     ggml_tensor * alpha = ggml_mul_mat(ctx, L.ssm_alpha, cur);
+    if (L.ssm_alpha_s) alpha = ggml_mul(ctx, alpha, L.ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx, alpha, num_v_heads, n_seq_tokens, n_seqs);
     alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
     alpha = ggml_softplus(ctx, alpha);
@@ -723,6 +735,7 @@ after_delta_net:
 
     // Output projection
     ggml_tensor * out = ggml_mul_mat(ctx, L.ssm_out, flat);
+    if (L.ssm_out_s) out = ggml_mul(ctx, out, L.ssm_out_s);
     out = ggml_reshape_2d(ctx, out, q35::N_HEAD * 0 + DFLASH27B_TARGET_HIDDEN, n_seq_tokens * n_seqs);
     return out;
 }
@@ -858,6 +871,7 @@ QwenGraphOutputs build_qwen35_graph(
 
     // 3. LM head
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, out);
+    if (w.output_s) logits = ggml_mul(ctx, logits, w.output_s);
     ggml_set_name(logits, "logits");
 
     ggml_build_forward_expand(gf, logits);

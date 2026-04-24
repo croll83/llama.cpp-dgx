@@ -286,6 +286,7 @@ bool load_target_gguf(const std::string & path,
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
     out.output   = g("output.weight");
+    out.output_s = g("output.scale");  // NVFP4 per-tensor scale2 (null on non-NVFP4)
     if (!out.tok_embd || !out.out_norm || !out.output) {
         set_last_error("missing top-level tensors (token_embd/output_norm/output)");
         gguf_free(gctx);
@@ -333,6 +334,21 @@ bool load_target_gguf(const std::string & path,
         L.ssm_dt_bias  = fnd("ssm_dt.bias");
         L.ssm_norm     = fnd("ssm_norm.weight");
         L.ssm_out      = fnd("ssm_out.weight");
+
+        // NVFP4 per-tensor scale2 tensors. Null for non-NVFP4 formats (TQ/Q4/Q8); fine — the
+        // graph code only applies them when non-null. Scales are shape {1}, fp32.
+        L.w_gate_s     = fnd("ffn_gate.scale");
+        L.w_up_s       = fnd("ffn_up.scale");
+        L.w_down_s     = fnd("ffn_down.scale");
+        L.wq_s         = fnd("attn_q.scale");
+        L.wk_s         = fnd("attn_k.scale");
+        L.wv_s         = fnd("attn_v.scale");
+        L.wo_s         = fnd("attn_output.scale");
+        L.wqkv_s       = fnd("attn_qkv.scale");
+        L.wqkv_gate_s  = fnd("attn_gate.scale");
+        L.ssm_beta_s   = fnd("ssm_beta.scale");
+        L.ssm_alpha_s  = fnd("ssm_alpha.scale");
+        L.ssm_out_s    = fnd("ssm_out.scale");
 
         // Sanity: each layer must be EITHER full-attn OR deltanet, not both, not neither.
         const bool has_attn = L.wq && L.wk && L.wv && L.wo && L.q_norm && L.k_norm;

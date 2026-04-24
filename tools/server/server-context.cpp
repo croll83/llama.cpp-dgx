@@ -2113,9 +2113,16 @@ private:
         // target graph is text-only and process_slot_dflash asserts on
         // non-text tokens via server_tokens::get_text_tokens().
         if (dflash_weights) {
+            // Guard: fall through to the standard path only if an ACTIVE task
+            // actually carries image/audio chunks. slot.prompt.tokens.has_mtmd
+            // is the slot-level capability flag (always true when --mmproj is
+            // loaded), so keying off it would disable dflash for every request
+            // even when the client sent text-only. Check task->tokens.has_media()
+            // instead: that reflects whether the current request really needs the
+            // main model's vision path.
             bool any_mtmd = false;
             for (auto & s : slots) {
-                if (s.is_processing() && s.prompt.tokens.has_mtmd) {
+                if (s.is_processing() && s.task && s.task->tokens.has_media()) {
                     any_mtmd = true;
                     break;
                 }

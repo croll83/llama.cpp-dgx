@@ -72,6 +72,21 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+
+    // Per-tensor post-mul_mat scales (NVFP4 scale2). Null for non-NVFP4 formats.
+    // Applied as: res = ggml_mul_mat(ctx, W, cur); if (W_s) res = ggml_mul(ctx, res, W_s);
+    ggml_tensor * w_gate_s       = nullptr;
+    ggml_tensor * w_up_s         = nullptr;
+    ggml_tensor * w_down_s       = nullptr;
+    ggml_tensor * wq_s           = nullptr;
+    ggml_tensor * wk_s           = nullptr;
+    ggml_tensor * wv_s           = nullptr;
+    ggml_tensor * wo_s           = nullptr;
+    ggml_tensor * wqkv_s         = nullptr;
+    ggml_tensor * wqkv_gate_s    = nullptr;
+    ggml_tensor * ssm_beta_s     = nullptr;
+    ggml_tensor * ssm_alpha_s    = nullptr;
+    ggml_tensor * ssm_out_s      = nullptr;
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -112,6 +127,7 @@ struct TargetWeights {
     std::vector<TargetLayer> layers;         // size = 64
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
+    ggml_tensor * output_s = nullptr;        // [1]            NVFP4 scale2 for output; null on non-NVFP4
 
     // Metadata from GGUF (validated at load time)
     int full_attention_interval = 4;
@@ -163,6 +179,19 @@ struct DraftWeights {
     ggml_tensor *          hidden_norm = nullptr;   // [hidden]
     std::vector<DraftLayer> layers;                 // size = 5
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
+
+    // 0 = non-causal draft (Qwen3.5-27B-DFlash, full_attention).
+    // > 0 = causal sliding-window attention (Qwen3.6-27B-DFlash); value is the
+    // window size in tokens (Qwen3.6 ships with 2048). Parsed from the draft's
+    // sibling config.json at load time.
+    int                    swa_window = 0;
+
+    // Per-layer SWA flag. true => apply causal sliding-window mask on that
+    // layer; false => full causal or non-causal (depending on swa_window).
+    // Qwen3.6-27B-DFlash ships with layer_types = [SWA,SWA,SWA,SWA,FULL],
+    // so the last layer uses full attention even though the model is "SWA".
+    // Empty when the draft is non-causal (swa_window == 0).
+    std::vector<bool>      layer_is_swa;
 };
 
 bool load_draft_safetensors(const std::string & path,
