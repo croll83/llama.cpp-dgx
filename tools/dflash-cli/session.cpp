@@ -108,7 +108,6 @@ static int argmax_f32(const float * x, int n) {
 // K/V view length used in build_attn_block.
 static constexpr int KQ_MASK_PAD = 32;
 static int g_kq_stride_pad = KQ_MASK_PAD;   // overridden to 256 when TBQ KV is active
-static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (default 4096)
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
 // F16 encoding for the two values we use: 0 and -inf.
@@ -798,7 +797,6 @@ extern "C" dflash_session_t * dflash_session_create_shared(dflash_weights_t * we
     // sessions in one server use the same params. Worth noting but not
     // worth a per-session refactor right now.
     if (s->params.kv_tbq) g_kq_stride_pad = 256;
-    if (s->params.max_ctx > 0) g_max_ctx_override = s->params.max_ctx;
 
     s->max_ctx           = s->params.max_ctx > 0 ? s->params.max_ctx : 4096;
     s->max_verify_tokens = s->params.ddtree
