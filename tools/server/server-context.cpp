@@ -3244,6 +3244,14 @@ private:
                 stats.decode_seconds, tps_decode, stats.n_draft_steps, accept_pct,
                 stats.n_draft_steps > 0 ? (double) stats.n_generated / stats.n_draft_steps : 0.0);
 
+        // Propagate the library-reported split into the OpenAI `timings`
+        // response fields (get_timings() reads t_prompt_processing /
+        // t_token_generation directly). send_final_response() is invoked
+        // before slot.release(), so release()'s own recomputation of
+        // t_token_generation doesn't overwrite what the client receives.
+        slot.t_prompt_processing = stats.prefill_seconds * 1000.0;
+        slot.t_token_generation  = stats.decode_seconds  * 1000.0;
+
         send_final_response(slot);
         slot.release();
     }
