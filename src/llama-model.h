@@ -439,6 +439,16 @@ struct llama_layer {
     struct ggml_tensor * ssm_alpha_in_s     = nullptr;
     struct ggml_tensor * ssm_beta_in_s      = nullptr;
 
+    // NVFP4_AWQ channel-wise pre_quant_scale (one value per input channel).
+    // Applied to the activation at matmul time:  x_scaled = x / pqs before
+    // matmul(weight, x_scaled). ModelOpt only emits pre_quant_scale for the
+    // "reducing" projections (attention o_proj, mlp down_proj); the other
+    // matmuls don't need one because the same normed residual feeds both
+    // q_proj and k_proj, so AWQ only needs one scale per sub-block.
+    struct ggml_tensor * wo_pqs         = nullptr;
+    struct ggml_tensor * ssm_out_pqs    = nullptr;
+    struct ggml_tensor * ffn_down_pqs   = nullptr;
+
     // altup & laurel
     struct ggml_tensor * per_layer_inp_gate   = nullptr;
     struct ggml_tensor * per_layer_proj       = nullptr;

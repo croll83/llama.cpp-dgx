@@ -8103,6 +8103,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
                 layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
+
+            // NVFP4_AWQ channel-wise pre_quant_scale — one value per input
+            // channel, applied as `x_scaled = x / pqs` before the matmul.
+            // Only emitted for the "reducing" projections (attn output,
+            // SSM output, FFN down) because AWQ shares a single pre_quant
+            // scale across all matmuls sharing the same input tensor.
+            if (!layer.wo_pqs && layer.wo) {
+                const int64_t in_dim = layer.wo->ne[0];
+                layer.wo_pqs = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "pre_quant_scale", i), {in_dim}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ssm_out_pqs && layer.ssm_out) {
+                const int64_t in_dim = layer.ssm_out->ne[0];
+                layer.ssm_out_pqs = create_tensor(tn(LLM_TENSOR_SSM_OUT, "pre_quant_scale", i), {in_dim}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_down_pqs && layer.ffn_down) {
+                const int64_t in_dim = layer.ffn_down->ne[0];
+                layer.ffn_down_pqs = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "pre_quant_scale", i), {in_dim}, TENSOR_NOT_REQUIRED);
+            }
         }
     }
 
@@ -8243,6 +8261,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+    // NVFP4_AWQ: per-tensor input_scale is NOT applied here. Based on the
+    // ModelOpt AWQ recipe, scale2 (stored in `.scale`) is the only per-tensor
+    // factor needed at inference; `.input_scale` is a TensorRT-LLM artefact
+    // for FP4 activation quantization and folding it in breaks the math.
+    // The channel-wise `.pre_quant_scale` is the AWQ scale, applied at the
+    // matmul call site (build_layer_attn / build_layer_ffn in qwen35.cpp)
+    // as `x_scaled = x / pqs` before the reducing projection.
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

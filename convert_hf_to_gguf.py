@@ -494,7 +494,9 @@ class ModelBase:
                         s = self.model_tensors[name]
                         self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
                         tensors_to_remove.append(name)
-                    if name.endswith((".k_scale", ".v_scale", ".pre_quant_scale")):
+                    # pre_quant_scale is kept alive until _generate_nvfp4_tensors'
+                    # late emit picks it up as a channel-wise F32 GGUF tensor.
+                    if name.endswith((".k_scale", ".v_scale")):
                         tensors_to_remove.append(name)
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
@@ -700,6 +702,42 @@ class ModelBase:
         # Remove consumed tensors so get_tensors/modify_tensors won't see them
         for name in consumed:
             self.model_tensors.pop(name, None)
+
+        # Emit NVFP4_AWQ channel-wise pre_quant_scale as a standalone F32
+        # tensor per weight. map_tensor_name doesn't know multimodal prefixes
+        # (model.language_model.*) so handle both forms by stripping first.
+        pqs_count = 0
+        all_pqs = [n for n in self.model_tensors.keys() if n.endswith(".pre_quant_scale")]
+        logger.info(f"pre_quant_scale pass: scanning {len(all_pqs)} candidate tensors")
+        for name in all_pqs:
+            base = name.removesuffix(".pre_quant_scale")
+            # Strip multimodal wrapper: model.language_model.X → model.X or X
+            weight_candidates = [
+                base + ".weight",
+                base.replace("model.language_model.", "model.") + ".weight",
+                base.replace("model.language_model.", "") + ".weight",
+            ]
+            mapped_weight = None
+            for wn in weight_candidates:
+                try:
+                    mapped_weight = self.map_tensor_name(wn)
+                    break
+                except Exception:
+                    continue
+            if mapped_weight is None:
+                logger.info(f"  skip {name}: no mapping for any of {weight_candidates}")
+                continue
+            pqs = self.model_tensors[name]()  # resolve lazy
+            if pqs.numel() <= 1:
+                del self.model_tensors[name]
+                continue
+            pqs_f32 = pqs.float().numpy().flatten().astype(np.float32)
+            out_name = mapped_weight.replace(".weight", ".pre_quant_scale")
+            logger.info(f"  + {out_name} (NVFP4_AWQ pqs, shape [{pqs_f32.size}])")
+            self.gguf_writer.add_tensor(out_name, pqs_f32)
+            del self.model_tensors[name]
+            pqs_count += 1
+        logger.info(f"pre_quant_scale pass: emitted {pqs_count} tensors")
 
         # Remove any remaining unused auxiliary tensors
         for name in list(self.model_tensors.keys()):
