@@ -988,9 +988,13 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     // 13K prompts vs ~336 tok/s at UBATCH=16, with a ~5% AL cost on the
     // following decode. Override via `DFLASH27B_PREFILL_UBATCH=N` env.
     const int prompt_len_auto = (int)prompt.size();
+    // Precedence: explicit session param > env var > auto-sized default.
     int prefill_ubatch_env = (prompt_len_auto > 2048) ? 192 : 16;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch_env = std::max(1, std::atoi(s));
+    }
+    if (s->params.prefill_ubatch > 0) {
+        prefill_ubatch_env = s->params.prefill_ubatch;
     }
     const int PREFILL_UBATCH = prefill_ubatch_env;
     std::printf("[prefill] ubatch=%d\n", PREFILL_UBATCH);
@@ -1005,13 +1009,17 @@ extern "C" int dflash_session_run(dflash_session_t * s,
     // bit BEFORE the end of prefill so chat-template re-tokenization on a
     // follow-up call (which typically diverges inside the last ~20 tokens,
     // i.e. the assistant-start header) has a rewind target earlier than
-    // the divergence. For prefills shorter than the offset we fall back
-    // to snapshotting post-prefill (see below).
-    constexpr int ANCHOR_REWIND_BACKOFF = 32;
+    // the divergence.
+    //
+    // The snapshot has to land on a ubatch boundary, so the effective
+    // backoff must exceed one ubatch or the anchor ends up at end-of-prefill
+    // (useless for rewind once lcp < prompt_len). We bump the backoff to
+    // max(32, PREFILL_UBATCH + 32) so there's always at least one boundary
+    // between the anchor and the end.
+    const int anchor_backoff =
+        std::max(32, PREFILL_UBATCH + 32);
     const int anchor_target_pos = prefill_kv_offset +
-        std::max(0, prompt_len - ANCHOR_REWIND_BACKOFF);
-    // Only re-snapshot when the new target is beyond any existing anchor
-    // — otherwise keep the older one so cross-run rewinds stay useful.
+        std::max(0, prompt_len - anchor_backoff);
     bool anchor_taken_this_prefill = false;
 
     for (int start = 0; start < prompt_len; start += PREFILL_UBATCH) {
@@ -1072,7 +1080,15 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         // soon as we cross anchor_target_pos. Doing it mid-prefill (rather
         // than post-prefill) means the anchor sits BEFORE the typical
         // chat-template divergence point at the tail of the prompt.
-        if (!anchor_taken_this_prefill && committed >= anchor_target_pos) {
+        //
+        // Only snap on FULL prefill (prefill_kv_offset == 0). Append-mode
+        // continuations arrive as small deltas, so re-snapping during them
+        // would move the anchor forward and defeat the next rewind — the
+        // anchor set during the last full prefill is still a valid
+        // rewind target as long as it's older than the new lcp.
+        if (!anchor_taken_this_prefill &&
+            prefill_kv_offset == 0 &&
+            committed >= anchor_target_pos) {
             snapshot_anchor_state(cache);
             cache.anchor_pos = committed;
             anchor_taken_this_prefill = true;
@@ -1084,11 +1100,11 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
                 last_tok);
 
-    // Fallback anchor: if the prefill loop didn't take one (e.g. the
-    // caller passed 0 delta tokens in append mode, or the backoff-adjusted
-    // target landed exactly at position 0) snap the current state so the
-    // next call has at least something to rewind to.
-    if (!anchor_taken_this_prefill && committed > 0) {
+    // Fallback anchor: if the prefill loop didn't take one during a full
+    // prefill — typically because the prompt is shorter than the
+    // ubatch-aware backoff — snap the post-prefill state. Only runs on
+    // append_mode=0 for the same reason as the in-loop check.
+    if (!anchor_taken_this_prefill && prefill_kv_offset == 0 && committed > 0) {
         snapshot_anchor_state(cache);
         cache.anchor_pos = committed;
     }
