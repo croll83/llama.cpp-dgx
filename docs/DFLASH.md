@@ -57,10 +57,7 @@ Then the standard OpenAI API is served:
 - Greedy decoding only — the llama-server sampler is bypassed for tokens
   produced by DFlash. `temperature`, `top_p`, `grammar`, `logit_bias` are
   ignored.
-- The main model weights are loaded twice (once by `llama_model` for
-  tokenizer / chat-template / sampler; once by `dflash_session` for
-  verify). The second copy can be elided later by switching the main load
-  to `vocab_only` when `--dflash` is set.
+- ~~The main model weights are loaded twice~~ *(Fixed in commit 0efab257a — main model now loads vocab_only when --dflash is set, saving ~14 GB VRAM. process_slot_dflash restores slot.n_ctx to the dflash target cache size so the normal in-context-size check keeps working.)*
 - Prompt caching only hits when the new prompt is a strict extension of
   the cached token stream. Chat-template re-tokenization across turns can
   break strict extension; a follow-up will either align
@@ -85,3 +82,28 @@ void dflash_session_destroy(s);
 
 Set `append_mode=1` to reuse cached KV + SSM state from a previous run
 (callers must ensure `prompt_ids` is the delta past `dflash_session_kv_end`).
+
+## Measured results (GB10, 27B TQ3_4S target + Qwen3.6 draft, ddtree-budget=22)
+
+| Metric                         | Value          |
+|--------------------------------|----------------|
+| llama-server VRAM (vocab_only) | **19.7 GiB**   |
+| VRAM without vocab_only        | 35.3 GiB       |
+| Sequential requests (50 × max_tokens=20) | 100% success |
+| Accept rate (per verify)       | ~40%           |
+| tok/s wall-clock (predictable prompt) | 30-40   |
+| tok/s wall-clock (reasoning prompt)   | 15-20   |
+| tok/s dflash-internal (predicted_per_second) | 100-210 |
+| Streaming SSE (delta per token)| works          |
+
+## Known limitations / follow-ups
+
+1. Single slot (-np 1) — multi-slot needs 1 dflash_session per slot or a
+   queue; target weights would need to be shared between sessions.
+2. Greedy only — llama-server's sampler is bypassed. Temperature /
+   top_p / grammar / logit_bias are ignored.
+3. Prompt caching: hits only on strict extension (cached ⊂ new). Chat
+   turns re-tokenized via the template usually don't match strictly;
+   see the rewind/SSM-snapshot note in server-context.cpp.
+4. TurboQuant V-cache not wired in — ggml-cuda/cpy.cu has no F32 → TQ3/
+   TURBO* kernels so dflash's Q/K/V→KV copy can't use them.
