@@ -883,6 +883,20 @@ extern "C" dflash_session_t * dflash_session_create_shared(dflash_weights_t * we
     // sessions in one server use the same params. Worth noting but not
     // worth a per-session refactor right now.
     if (s->params.kv_tbq) g_kq_stride_pad = 256;
+    // Mirror: if env asked for a 3-bit KV quant, bump the FA stride pad too,
+    // otherwise build_full_attn_block lands on a fattn kernel that asserts
+    // K->ne[1] % FATTN_KQ_STRIDE == 0.
+    auto env_is_3bit = [](const char * name) {
+        const char * v = std::getenv(name);
+        if (!v) return false;
+        std::string s(v);
+        return s == "tq3_0" || s == "turbo3" || s == "turbo3_0" ||
+               s == "turbo2" || s == "turbo2_0" || s == "turbo4" || s == "turbo4_0";
+    };
+    if (env_is_3bit("DFLASH27B_KV_K") || env_is_3bit("DFLASH27B_KV_V") ||
+        std::getenv("DFLASH27B_KV_TQ3") || std::getenv("DFLASH27B_KV_Q4")) {
+        g_kq_stride_pad = 256;
+    }
 
     s->max_ctx           = s->params.max_ctx > 0 ? s->params.max_ctx : 4096;
     s->max_verify_tokens = s->params.ddtree

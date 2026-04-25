@@ -434,13 +434,21 @@ static ggml_tensor * build_full_attn_block(
     // ── Flash attention over the valid slice [0, kv_start + n_tokens)
     const int kv_len = kv_start + n_tokens;
 
-    // FA kernel alignment requirements for the kv view length (f16/Q* paths
-    // are stride 1; future TurboQuant paths would need 256 alignment, kept
-    // behind a compile-time constant here for drop-in extension).
-    // FATTN_KQ_STRIDE=256 (see fattn.cu:get_best_fattn_kernel). Round up
-    // for TBQ cache types; the caller's attn_mask is built with the same
-    // padded length so positions beyond the real kv_len get -inf.
-    const int fattn_stride  = 1;
+    // FA kernel alignment requirements for the kv view length:
+    //   - f16 / Q4_0 / Q8_0 paths: stride 1 (FA accepts any length)
+    //   - TQ3_0 / TURBO* paths: need K->ne[1] divisible by FATTN_KQ_STRIDE=256
+    //     (see fattn.cu:1348 can_use_vector_kernel and similar checks).
+    // The K/V cache types are picked from env in this file, so we read them
+    // back from the existing tensors and bump the pad to 256 when either
+    // side is a 3-bit format. The caller's attn_mask is built using
+    // g_kq_stride_pad (set to 256 by session.cpp at init when kv_tbq is on,
+    // or here we mirror it locally) so positions beyond real kv_len get -inf.
+    auto needs_fa_stride_256 = [](ggml_type t) {
+        return t == GGML_TYPE_TQ3_0 || t == GGML_TYPE_TURBO2_0 ||
+               t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+               t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+    };
+    const int fattn_stride  = (needs_fa_stride_256(cache_k->type) || needs_fa_stride_256(cache_v->type)) ? 256 : 1;
     const int kv_len_padded = ((kv_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
     // Q needs to be [head_dim, n_tokens, n_head] for flash_attn_ext
