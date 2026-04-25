@@ -1059,8 +1059,19 @@ json oaicompat_chat_params_parse(
         /* TODO: test this properly */
         inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
 
-        if ( inputs.enable_thinking ) {
-            throw std::invalid_argument("Assistant response prefill is incompatible with enable_thinking.");
+        // Assistant-prefill (continue an assistant turn) is semantically
+        // incompatible with thinking: we can't retroactively inject a
+        // <think>...</think> block before content the client has already
+        // committed to. Upstream raises HTTP 400 here; in this fork we
+        // instead silently downgrade enable_thinking -> false and warn,
+        // because the dgx default is --reasoning auto (= thinking on by
+        // default) and tool-using agents that streaming-prefill assistant
+        // messages would otherwise fail every request. Clients can still
+        // request thinking explicitly per-turn via chat_template_kwargs;
+        // we only downgrade when the prefill path was actually triggered.
+        if (inputs.enable_thinking) {
+            SRV_WRN("%s", "assistant prefill detected — auto-downgrading enable_thinking=false for this request (upstream throws here)\n");
+            inputs.enable_thinking = false;
         }
 
         inputs.add_generation_prompt = true;
