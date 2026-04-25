@@ -8,6 +8,14 @@ deprecated = "warn"
 [src]
 exclude = [
     "./tools/mtmd/legacy-models/**",
+    # llama.cpp-dgx fork: NVFP4 / dflash helper scripts depend on the NVIDIA
+    # ModelOpt SDK (modelopt.torch.quantization, modelopt.torch.export) and
+    # CUDA-only safetensors plumbing that is not installed in the type-check
+    # CI runner. They are run by hand on the GB10 box, not under CI.
+    "./tools/dflash-cli/quantize_nvfp4_plain.py",
+    "./tools/dflash-cli/strip_visual.py",
+    "./tools/dflash-cli/inject_pqs.py",
+    "./tools/dflash-cli/bench_chat.py",
 ]
 
 [[overrides]]
