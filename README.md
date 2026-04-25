@@ -61,7 +61,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 | `--dflash-max-ctx N` | `llama-server` | Per-slot dflash KV ring size. Default `--ctx-size / n_parallel`. |
 | `--dflash-prefill-ubatch N` | `llama-server` | dflash prefill ubatch size. Default 192 on GB10. |
 | `DFLASH27B_KV_V=tq3_0` | env | dflash V-cache type override (`q8_0` default; `tq3_0` saves ~25% on the V side). |
-| `DFLASH27B_KV_K=tq3_0` | env | dflash K-cache type override (verified at commit `6858a4192`; saves ~2.6 GiB on top of the standard `-ctk tq3_0` win). Pair with `DFLASH27B_KV_V=tq3_0` for max savings. |
+| `DFLASH27B_KV_K=tq3_0` | env | **Experimental — do NOT use in production.** Boots and runs short prompts cleanly (commit `6858a4192` fixed the SIGSEGV by forcing the VEC fattn kernel) but hits a long-generation token-loop pathology on agent workloads (~78K committed tokens before it converges on a single repeated token id). Suspected cause: cumulative attention-score degradation from 3.5 bpw K compounded over thousands of decode steps in the dflash custom graph. Standard llama path `-ctk tq3_0` is unaffected and remains the recommended K-quant shortcut. |
 | `DFLASH27B_KV_TQ3=1` | env | Both dflash K and V to TQ3_0 in one shot. |
 | `DFLASH27B_KV_F16=1` | env | Force dflash KV back to f16 (regression baseline). |
 | `TURBO_LAYER_ADAPTIVE=N` | env | Layer-adaptive Turbo KV quant (1–11 strategies; 0 = uniform, default). |
@@ -71,7 +71,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 For 262K context with `-np 2` (two persistent slots, e.g. agent + memory writer) on the Qwopus3.6 27B target:
 
 ```bash
-DFLASH27B_KV_K=tq3_0 DFLASH27B_KV_V=tq3_0 \
+DFLASH27B_KV_V=tq3_0 \
 ./build/bin/llama-server \
   -m /path/to/Qwopus-27B-NVFP4-plain.gguf \
   --mmproj /path/to/mmproj-Abliterated-F16.gguf \
@@ -83,11 +83,12 @@ DFLASH27B_KV_K=tq3_0 DFLASH27B_KV_V=tq3_0 \
   --jinja --reasoning auto --alias dark-opus --no-webui --no-warmup
 ```
 
-This gives ~34.9 GiB resident on GPU (NVFP4 weights borrowed from llama_model + standard KV K=TQ3_0 V=TQ3_0 + dflash K+V=TQ3_0 ring, np=2). Down from 58.4 GiB on the same workload before the borrow / TQ3 / fattn-VEC patches landed (~40% saving).
+This gives ~37.7 GiB resident on GPU (NVFP4 weights borrowed from llama_model + standard KV K=TQ3_0 V=TQ3_0 + dflash V=TQ3_0 ring, dflash K stays Q8_0, np=2). Down from 58.4 GiB on the same workload before the borrow / TQ3 patches landed (~36% saving). The dflash K=TQ3_0 path would shave another ~2.8 GiB but causes long-generation loops, so it is intentionally not enabled by default — see the flags reference for `DFLASH27B_KV_K=tq3_0`.
 
 ## Troubleshooting
 
 - **Server dies silently right after `DFlash run:` log line, no `GGML_ASSERT` or CUDA error in the output.** Pre-`6858a4192` symptom of K=TQ3_0 selecting the MMA fattn kernel — which has no TQ3_0 dequant entry — and crashing on a NULL function pointer inside `launch_fattn<...>()`. Fixed by extending the force-VEC predicate in `ggml-cuda/fattn.cu` to include `GGML_TYPE_TQ3_0`. Re-pull and rebuild; if you still see this, get a backtrace with `gdb -batch -ex run llama-dflash <args>` to confirm.
+- **Agent stalls at "No response from provider for 180s", server log shows endless `[step N] committed=… last_tok=X next=X` with the same `X` for thousands of iterations.** Token-loop pathology when `DFLASH27B_KV_K=tq3_0` is set: the dflash custom decode graph produces a self-reinforcing prediction on a single token after ~tens of thousands of committed tokens. Stop the server, `unset DFLASH27B_KV_K`, restart. Standard path `-ctk tq3_0` is fine to keep — only the env-driven dflash K override has this issue. Tracking in [`docs/dflash_kv_quant_status.md`](docs/dflash_kv_quant_status.md).
 - **`speculative decoding not supported by this context` log line on init.** Expected with `--dflash`: this is the legacy speculative-decoding path's compat probe failing because the dflash session takes over. The DFlash session is unrelated.
 - **`cache_reuse is not supported by multimodal` log line.** Expected with `--mmproj` + `--cache-reuse`. The prompt cache stays effective for slot persistence; only the cross-request prefix-match path is disabled.
 - **`fattn vec kernel` aborts with K%256 != 0.** Either the cache type is one of the TQ3_0 / TURBO* family on the standard path (the fork bumps `fattn_stride` to 256 automatically — make sure you're on `origin/feature/dflash-integration` or later) or you set `--dflash-max-ctx` to a non-256-aligned value.
@@ -101,8 +102,10 @@ This gives ~34.9 GiB resident on GPU (NVFP4 weights borrowed from llama_model + 
 | Baseline (np=2, mmproj, NVFP4, weights duplicated) | 58.4 GiB | — |
 | + borrow llama_model weights (commit `87102e46b`) | 39.9 GiB | −18.5 GiB |
 | + standard `-ctk tq3_0 -ctv tq3_0` (commit `7b5f82569`) | 37.5 GiB | −2.4 GiB |
-| + dflash `DFLASH27B_KV_K=tq3_0` + force-VEC fix (commit `6858a4192`) | **34.9 GiB** | **−2.6 GiB** |
-| **cumulative** |   | **−23.5 GiB / −40 %** |
+| **stable end-state** | **37.5 GiB** | **−20.9 GiB / −36 %** |
+| (extra) dflash `DFLASH27B_KV_K=tq3_0` + force-VEC fix (commit `6858a4192`) | 34.9 GiB | −2.6 GiB but **unstable**: long-generation token loop |
+
+The last row is left in the codebase as a documented experimental knob — see the flags reference. `DFLASH27B_KV_K=tq3_0` boots, passes short-prompt sanity, but loses coherence on agent-style multi-turn / long-decode workloads (we saw the model degenerate to a single-token loop after ~78K committed tokens). Standard path `-ctk tq3_0` is unaffected.
 
 ## Benchmarks (GB10, NVFP4 + mmproj, np=2, c=262144)
 
@@ -123,13 +126,13 @@ Memory footprint at this config (idle, after first warmup pass):
 |---|---:|
 | NVFP4 target weights (borrowed) | 15.5 GiB |
 | Standard llama_kv_cache (K=TQ3_0 + V=TQ3_0, 16 attn layers × 131K × 2 seqs) | 3.6 GiB |
+| DFlash per-slot ring (K=Q8_0 + V=TQ3_0 + SSM + target_feat, ×2 slots) | ~13 GiB |
 | Standard compute buffer + recurrent state | 2.1 GiB |
 | mmproj vision encoder | 0.9 GiB |
-| DFlash per-slot ring (K+V+SSM+target_feat, ×2 slots) | ~13 GiB |
 | Draft model (Qwen3.6-27B-DFlash) | 0.9 GiB |
 | Prompt cache (server-side, lazy, capped 8 GiB) | up to 8 GiB |
 | CUDA runtime + libraries | ~3 GiB |
-| **Total resident on GB10** | **~34.9 GiB** |
+| **Total resident on GB10** | **~37.7 GiB** (stable; 34.9 GiB unstable with K=TQ3_0 on dflash) |
 
 For comparison on the same workload, lucebox-hub's `llama-dflash-server` standalone (no `--mmproj`, no prompt cache, single slot, Q4_K_M target) runs at ~25–50 tok/s and 26.6 GiB resident. The ~13 GiB delta is the price of `--mmproj` + `-np 2` + the prompt cache; remove either of those to recover most of it.
 
