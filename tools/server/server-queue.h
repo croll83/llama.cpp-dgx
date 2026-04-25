@@ -29,6 +29,12 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    // Fast cancel hook: invoked from server_response_reader::stop on the
+    // I/O thread BEFORE the cancel task is enqueued, so that a long-running
+    // synchronous decode (e.g. dflash_session_run) can observe the cancel
+    // request even while it holds the worker thread. Receives the task id
+    // to cancel.
+    std::function<void(int /* id_task */)> callback_cancel_request;
 
 public:
     // Add a new task to the end of the queue
@@ -93,6 +99,17 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register the cancel-request fast path. See callback_cancel_request.
+    void on_cancel_request(std::function<void(int)> callback) {
+        callback_cancel_request = std::move(callback);
+    }
+
+    // Invoke the registered cancel-request hook (if any) for the given task id.
+    // Used by server_response_reader::stop on the I/O thread.
+    void fire_cancel_request(int id_task) const {
+        if (callback_cancel_request) callback_cancel_request(id_task);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

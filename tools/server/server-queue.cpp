@@ -437,6 +437,11 @@ void server_response_reader::stop() {
         cancel_tasks.reserve(id_tasks.size());
         for (const auto & id_task : id_tasks) {
             SRV_WRN("cancel task, id_task = %d\n", id_task);
+            // Fast path: notify the worker that this task is being cancelled
+            // so a long-running synchronous decode (e.g. dflash_session_run)
+            // can observe the request and break the loop before the queued
+            // CANCEL task is even processed by update_slots.
+            queue_tasks.fire_cancel_request(id_task);
             server_task task(SERVER_TASK_TYPE_CANCEL);
             task.id_target = id_task;
             queue_results.remove_waiting_task_id(id_task);

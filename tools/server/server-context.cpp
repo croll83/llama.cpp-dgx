@@ -9,6 +9,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include <atomic>
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -67,6 +68,14 @@ struct server_slot {
     // server_context_impl::dflash_weights; nullptr when --dflash is off.
     // Freed in server_context_impl::destroy() before the shared weights.
     dflash_session_t * dflash_session = nullptr;
+
+    // Cancel signal for an in-flight dflash decode. Set from the HTTP cancel
+    // hook (server_response_reader::stop fast-path), read from the dflash
+    // token callback to short-circuit the run between iterations. Atomic so
+    // we do not need to take the slot lock from the I/O thread. Heap-allocated
+    // so the enclosing server_slot stays movable into the slots vector
+    // (std::atomic itself is neither copyable nor movable).
+    std::unique_ptr<std::atomic<bool>> dflash_cancel_flag = std::make_unique<std::atomic<bool>>(false);
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -999,6 +1008,18 @@ private:
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
+        });
+        queue_tasks.on_cancel_request([this](int id_task) {
+            // Fast cancel: flag the matching slot so an in-flight
+            // dflash_session_run can break out at the next iteration.
+            // The queued SERVER_TASK_TYPE_CANCEL still runs later through
+            // update_slots and triggers the proper slot.release() bookkeeping.
+            for (auto & s : slots) {
+                if (s.task && s.task->id == id_task) {
+                    if (s.dflash_cancel_flag) s.dflash_cancel_flag->store(true, std::memory_order_relaxed);
+                    break;
+                }
+            }
         });
 
         metrics.init();
@@ -3153,6 +3174,15 @@ private:
     static int dflash_on_token_thunk(int32_t tok, void * user) {
         auto * c = (dflash_cb_ctx *) user;
         if (c->stop) return 0;
+        // Fast cancel path: HTTP handler set this flag without going through
+        // the worker queue (which is blocked inside dflash_session_run while
+        // we are here). Returning 0 tells the dflash session to abort at the
+        // next iteration boundary.
+        if (c->slot->dflash_cancel_flag && c->slot->dflash_cancel_flag->load(std::memory_order_relaxed)) {
+            SLT_INF(*c->slot, "%s", "DFlash: external cancel observed, aborting decode\n");
+            c->stop = true;
+            return 0;
+        }
 
         completion_token_output out{};
         out.tok  = (llama_token) tok;
@@ -3256,8 +3286,22 @@ private:
             delta_ids.push_back((int32_t) task_toks[i]);
         }
 
+        // Default n_gen cap: when the client doesn't set max_tokens / n_predict
+        // (very common with poorly-configured agents), the historical default
+        // was "fill the entire remaining context" (slot.n_ctx - n_prompt - 32).
+        // On a 131K dflash session that gives n_gen ~= 96K, which combined with
+        // attention degradation past ~60K decoded tokens lets the decode loop
+        // run for HOURS spitting a single repeated token (we observed 21406 s
+        // of wall time on a single canceled request before n_gen was hit).
+        // Cap the unset-n_predict case at a sane default; clients that really
+        // want long generation can opt in by passing an explicit max_tokens.
+        constexpr int DFLASH_DEFAULT_N_GEN_CAP = 8192;
         int n_gen = slot.task->params.n_predict;
-        if (n_gen <= 0) n_gen = std::max(1, slot.n_ctx - n_prompt - 32);
+        if (n_gen <= 0) {
+            const int avail = std::max(1, slot.n_ctx - n_prompt - 32);
+            n_gen = std::min(avail, DFLASH_DEFAULT_N_GEN_CAP);
+            SLT_INF(slot, "DFlash: n_predict unset, using default cap n_gen=%d (avail=%d)\n", n_gen, avail);
+        }
 
         // Report the effective cache hit: prefill_off covers both the plain
         // "strict extension" case (prefill_off == lcp) and the anchor-rewind
@@ -3266,6 +3310,7 @@ private:
         slot.n_prompt_tokens_processed = (int) delta_ids.size();
         slot.state              = SLOT_STATE_GENERATING;
         slot.t_start_generation = ggml_time_us();
+        if (slot.dflash_cancel_flag) slot.dflash_cancel_flag->store(false, std::memory_order_relaxed);
 
         dflash_cb_ctx cc{};
         cc.impl = this;
