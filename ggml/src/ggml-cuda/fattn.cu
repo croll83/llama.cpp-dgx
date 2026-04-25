@@ -1328,13 +1328,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
 
-    // TurboQuant: only the vec kernel has native turbo dequant support.
-    // No FATTN_KQ_STRIDE alignment needed — vec kernel handles arbitrary lengths.
+    // TurboQuant + TQ3_0 K: only the vec kernel has native dequant support
+    // (vec_dot_fattn_vec_KQ_tq3_0 / *_turbo*). The MMA / WMMA / TILE paths
+    // would land on a null function pointer for these K types, which on
+    // GB10 manifests as SIGSEGV inside launch_fattn<...>(). No
+    // FATTN_KQ_STRIDE alignment needed — vec kernel handles arbitrary lengths.
     if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
         K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
         K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ ||
-        K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+        K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ ||
+        K->type == GGML_TYPE_TQ3_0) {
         if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0)
             return BEST_FATTN_KERNEL_VEC;
         return BEST_FATTN_KERNEL_NONE;
