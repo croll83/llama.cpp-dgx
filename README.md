@@ -18,7 +18,7 @@ The four tracks:
 
 3. **NVFP4 (FP4 tensor cores) inference** — native NVFP4 matmul + per-tensor scale2 application after the kernel, tracking the WIP upstream PRs ([#21089](https://github.com/ggml-org/llama.cpp/pull/21089), [#20977](https://github.com/ggml-org/llama.cpp/issues/20977)). Loader path supports plain NVFP4 (NVIDIA ModelOpt `NVFP4_DEFAULT_CFG`); the AWQ variant (`NVFP4_AWQ_LITE_CFG`) is intentionally not used because llama.cpp does not apply the AWQ `.pre_quant_scale` channel-wise factor at inference and therefore returns garbage tokens when the model is exported with the AWQ recipe. The dflash custom target graph (see below) also applies the per-tensor scale2 after every `ggml_mul_mat` so NVFP4 + speculative decoding work end-to-end.
 
-4. **DFlash MTP speculative decoding** — block-diffusion draft + DDtree verify integration, ported from [Luce-Org / lucebox-hub](https://github.com/Luce-Org/lucebox-hub) (`tools/dflash-cli/`). Wired into `llama-server` so that the dflash custom target graph runs in place of `llama_decode` for text-only requests, while `mmproj` (vision) requests fall back to the standard path. Includes causal sliding-window-attention support for the Qwen3.6-27B-DFlash draft (4 SWA layers + 1 full-attention layer), and a borrow path that lets dflash share the host `llama_model`'s on-GPU weight tensors instead of re-uploading them — saves ~15 GiB of VRAM when `--mmproj` is set.
+4. **DFlash MTP speculative decoding** — block-diffusion draft + DDtree verify integration, ported from [Luce-Org / lucebox-hub](https://github.com/Luce-Org/lucebox-hub) (`tools/dflash-cli/`). Wired into `llama-server` so that the dflash custom target graph runs in place of `llama_decode` for text-only requests, while `mmproj` (vision) requests fall back to the standard path. Includes causal sliding-window-attention support for the Qwen3.6-27B-DFlash draft (4 SWA layers + 1 full-attention layer), and a borrow path that lets dflash share the host `llama_model`'s on-GPU weight tensors instead of re-uploading them — saves ~18.5 GiB of VRAM when `--mmproj` is set.
 
 ### Blackwell / GB10 specifics (custom vs upstream)
 
@@ -61,7 +61,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 | `--dflash-max-ctx N` | `llama-server` | Per-slot dflash KV ring size. Default `--ctx-size / n_parallel`. |
 | `--dflash-prefill-ubatch N` | `llama-server` | dflash prefill ubatch size. Default 192 on GB10. |
 | `DFLASH27B_KV_V=tq3_0` | env | dflash V-cache type override (`q8_0` default; `tq3_0` saves ~25% on the V side). |
-| `DFLASH27B_KV_K=tq3_0` | env | (unverified) dflash K-cache type override. Standard path `-ctk tq3_0` is the verified shortcut today. |
+| `DFLASH27B_KV_K=tq3_0` | env | dflash K-cache type override (verified at commit `6858a4192`; saves ~2.6 GiB on top of the standard `-ctk tq3_0` win). Pair with `DFLASH27B_KV_V=tq3_0` for max savings. |
 | `DFLASH27B_KV_TQ3=1` | env | Both dflash K and V to TQ3_0 in one shot. |
 | `DFLASH27B_KV_F16=1` | env | Force dflash KV back to f16 (regression baseline). |
 | `TURBO_LAYER_ADAPTIVE=N` | env | Layer-adaptive Turbo KV quant (1–11 strategies; 0 = uniform, default). |
@@ -71,7 +71,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 For 262K context with `-np 2` (two persistent slots, e.g. agent + memory writer) on the Qwopus3.6 27B target:
 
 ```bash
-DFLASH27B_KV_V=tq3_0 \
+DFLASH27B_KV_K=tq3_0 DFLASH27B_KV_V=tq3_0 \
 ./build/bin/llama-server \
   -m /path/to/Qwopus-27B-NVFP4-plain.gguf \
   --mmproj /path/to/mmproj-Abliterated-F16.gguf \
@@ -83,16 +83,26 @@ DFLASH27B_KV_V=tq3_0 \
   --jinja --reasoning auto --alias dark-opus --no-webui --no-warmup
 ```
 
-This gives ~37.5 GiB resident on GPU (NVFP4 weights borrowed from llama_model + standard KV K=TQ3_0 V=TQ3_0 + dflash V=TQ3_0 ring, np=2).
+This gives ~34.9 GiB resident on GPU (NVFP4 weights borrowed from llama_model + standard KV K=TQ3_0 V=TQ3_0 + dflash K+V=TQ3_0 ring, np=2). Down from 58.4 GiB on the same workload before the borrow / TQ3 / fattn-VEC patches landed (~40% saving).
 
 ## Troubleshooting
 
-- **Server dies silently right after `DFlash run:` log line, no `GGML_ASSERT` or CUDA error in the output.** This is the open dflash K=TQ3_0 path; remove `DFLASH27B_KV_K=tq3_0` and stay on the standard `-ctk tq3_0` for now. The dflash V-cache path is unaffected.
+- **Server dies silently right after `DFlash run:` log line, no `GGML_ASSERT` or CUDA error in the output.** Pre-`6858a4192` symptom of K=TQ3_0 selecting the MMA fattn kernel — which has no TQ3_0 dequant entry — and crashing on a NULL function pointer inside `launch_fattn<...>()`. Fixed by extending the force-VEC predicate in `ggml-cuda/fattn.cu` to include `GGML_TYPE_TQ3_0`. Re-pull and rebuild; if you still see this, get a backtrace with `gdb -batch -ex run llama-dflash <args>` to confirm.
 - **`speculative decoding not supported by this context` log line on init.** Expected with `--dflash`: this is the legacy speculative-decoding path's compat probe failing because the dflash session takes over. The DFlash session is unrelated.
 - **`cache_reuse is not supported by multimodal` log line.** Expected with `--mmproj` + `--cache-reuse`. The prompt cache stays effective for slot persistence; only the cross-request prefix-match path is disabled.
 - **`fattn vec kernel` aborts with K%256 != 0.** Either the cache type is one of the TQ3_0 / TURBO* family on the standard path (the fork bumps `fattn_stride` to 256 automatically — make sure you're on `origin/feature/dflash-integration` or later) or you set `--dflash-max-ctx` to a non-256-aligned value.
 - **`Failed to parse input at pos 41: 不休ief粟…`** Output garbage on NVFP4 means the per-tensor `.scale` tensors did not load. Re-export the model with NVFP4 plain (`NVFP4_DEFAULT_CFG`), not AWQ (`NVFP4_AWQ_LITE_CFG`); see [`tools/dflash-cli/quantize_nvfp4_plain.py`](tools/dflash-cli/quantize_nvfp4_plain.py).
 - **OOM during model load with `--mmproj` + `--dflash`.** The borrow path is auto-enabled in this configuration; if you see two ~15 GiB "CUDA0 model buffer" log lines instead of one, re-pull and rebuild — the patch is in commit `87102e46b`.
+
+## Memory savings stack
+
+| Stage | GPU resident | Δ |
+|---|---:|---:|
+| Baseline (np=2, mmproj, NVFP4, weights duplicated) | 58.4 GiB | — |
+| + borrow llama_model weights (commit `87102e46b`) | 39.9 GiB | −18.5 GiB |
+| + standard `-ctk tq3_0 -ctv tq3_0` (commit `7b5f82569`) | 37.5 GiB | −2.4 GiB |
+| + dflash `DFLASH27B_KV_K=tq3_0` + force-VEC fix (commit `6858a4192`) | **34.9 GiB** | **−2.6 GiB** |
+| **cumulative** |   | **−23.5 GiB / −40 %** |
 
 ## Benchmarks (GB10, NVFP4 + mmproj, np=2, c=262144)
 
@@ -112,14 +122,14 @@ Memory footprint at this config (idle, after first warmup pass):
 | Component | Size |
 |---|---:|
 | NVFP4 target weights (borrowed) | 15.5 GiB |
-| Standard llama_kv_cache (K=Q8_0 + V=TQ3_0, 16 attn layers × 131K × 2 seqs) | 6.1 GiB |
+| Standard llama_kv_cache (K=TQ3_0 + V=TQ3_0, 16 attn layers × 131K × 2 seqs) | 3.6 GiB |
 | Standard compute buffer + recurrent state | 2.1 GiB |
 | mmproj vision encoder | 0.9 GiB |
 | DFlash per-slot ring (K+V+SSM+target_feat, ×2 slots) | ~13 GiB |
 | Draft model (Qwen3.6-27B-DFlash) | 0.9 GiB |
 | Prompt cache (server-side, lazy, capped 8 GiB) | up to 8 GiB |
 | CUDA runtime + libraries | ~3 GiB |
-| **Total resident on GB10** | **~40 GiB** |
+| **Total resident on GB10** | **~34.9 GiB** |
 
 For comparison on the same workload, lucebox-hub's `llama-dflash-server` standalone (no `--mmproj`, no prompt cache, single slot, Q4_K_M target) runs at ~25–50 tok/s and 26.6 GiB resident. The ~13 GiB delta is the price of `--mmproj` + `-np 2` + the prompt cache; remove either of those to recover most of it.
 
