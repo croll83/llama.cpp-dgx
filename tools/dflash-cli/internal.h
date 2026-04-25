@@ -350,6 +350,15 @@ struct QwenGraphInputs {
     // tensor of shape [n_tokens] giving each token's parent index in the
     // DFS-flattened tree. See test_dflash.cpp::build_target_step_tree.
     ggml_tensor * parent_ids = nullptr;
+
+    // Optional [n_tokens] i32 indices: which K/V slot in cache_k/cache_v
+    // to write each new token into. When non-null and the cache type is
+    // TQ3_0 (or other quantized type), build_full_attn_block uses
+    // ggml_set_rows instead of ggml_cpy on a strided 3D view — the cpy
+    // path silently corrupts the K cache for TQ3_0 because cpy_blck
+    // assumes 32 contiguous floats per block but a 3D view into a
+    // quantized cache lays them out non-contiguously between rows.
+    ggml_tensor * kv_idxs = nullptr;
 };
 
 struct QwenGraphOutputs {

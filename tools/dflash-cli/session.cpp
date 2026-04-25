@@ -503,6 +503,7 @@ struct StepGraph {
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
+    ggml_tensor *   kv_idxs = nullptr;            // [n_tokens] i32, set_rows index
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -529,6 +530,7 @@ static void step_graph_free(StepGraph & sg) {
     sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.parent_ids = nullptr;
+    sg.kv_idxs = nullptr;
     sg.logits = nullptr;
     sg.delta_captures.clear();
 }
@@ -602,12 +604,19 @@ static bool build_target_step(
         ggml_set_input(sg.attn_mask);
     }
 
+    // Always allocate kv_idxs: build_full_attn_block uses it for the K cache
+    // write when the cache is TQ3_0 (set_rows path). Cheap (4*n_tokens bytes).
+    sg.kv_idxs = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(sg.kv_idxs, "kv_idxs");
+    ggml_set_input(sg.kv_idxs);
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     QwenGraphInputs gi{};
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
+    gi.kv_idxs                    = sg.kv_idxs;
     gi.n_tokens                   = n_tokens;
     gi.kv_start                   = kv_start;
     gi.capture_layers             = capture;
@@ -672,12 +681,18 @@ static bool build_target_step_tree(
     ggml_set_name(sg.parent_ids, "parent_ids");
     ggml_set_input(sg.parent_ids);
 
+    // kv_idxs[n_tokens] i32 — set_rows index for K cache write on TQ3_0.
+    sg.kv_idxs = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(sg.kv_idxs, "kv_idxs");
+    ggml_set_input(sg.kv_idxs);
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     QwenGraphInputs gi{};
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
+    gi.kv_idxs                    = sg.kv_idxs;
     gi.n_tokens                   = n_tokens;
     gi.kv_start                   = kv_start;
     gi.capture_layers             = true;
@@ -1210,6 +1225,14 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         ggml_backend_tensor_set(sg.positions, pf_pos_buf.data(), 0,
                                 sizeof(int32_t) * pf_pos_buf.size());
 
+        // K cache row indices for set_rows (TQ3_0 path). Always upload —
+        // build_full_attn_block falls back to cpy when use_set_rows is false.
+        if (sg.kv_idxs) {
+            std::vector<int32_t> ki(n_tokens);
+            for (int i = 0; i < n_tokens; i++) ki[i] = abs_start + i;
+            ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * n_tokens);
+        }
+
         // Causal mask required when n_tokens > 1 OR when the TBQ FA kernel
         // is active (which pads kv_len to 256 and needs -inf on the padding
         // positions even for a single query).
@@ -1520,6 +1543,11 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             for (int i = 1; i < N; i++) parent_ids[i] = (int32_t)tree.parents[i];
             ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
                                     sizeof(int32_t) * N);
+            if (sg.kv_idxs) {
+                std::vector<int32_t> ki(N);
+                for (int i = 0; i < N; i++) ki[i] = committed + i;
+                ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * N);
+            }
 
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
@@ -1798,6 +1826,11 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 pos4_buf[3 * q_len + i] = 0;
             }
             ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
+            if (sg.kv_idxs) {
+                std::vector<int32_t> ki(q_len);
+                for (int i = 0; i < q_len; i++) ki[i] = committed + i;
+                ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * q_len);
+            }
 
             build_causal_mask(mask_buf, committed + q_len, q_len, committed);
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
@@ -1835,6 +1868,10 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 int p = committed + i;
                 p4_single[0] = p; p4_single[1] = p; p4_single[2] = p; p4_single[3] = 0;
                 ggml_backend_tensor_set(sg.positions, p4_single, 0, sizeof(int32_t) * 4);
+                if (sg.kv_idxs) {
+                    int32_t ki = committed + i;
+                    ggml_backend_tensor_set(sg.kv_idxs, &ki, 0, sizeof(int32_t));
+                }
 
                 st = ggml_backend_graph_compute(backend, sg.gf);
                 if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "seq verify compute %d at %d\n", (int)st, i); return 1; }
@@ -2044,6 +2081,11 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 replay_pos[3 * commit_n + i] = 0;
             }
             ggml_backend_tensor_set(sg.positions, replay_pos.data(), 0, sizeof(int32_t) * 4 * commit_n);
+            if (sg.kv_idxs) {
+                std::vector<int32_t> ki(commit_n);
+                for (int i = 0; i < commit_n; i++) ki[i] = committed + i;
+                ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * commit_n);
+            }
             if (replay_with_mask) {
                 build_causal_mask(mask_buf, committed + commit_n, commit_n, committed);
                 ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());

@@ -356,6 +356,7 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * cache_k,          // [head_dim, max_ctx, n_head_kv]
     ggml_tensor * cache_v,          // [head_dim, max_ctx, n_head_kv]
     ggml_tensor * attn_mask,        // [kv_len, n_tokens] f32 or nullptr
+    ggml_tensor * kv_idxs,          // [n_tokens] i32, set_rows index for TQ3_0 K
     int kv_start,
     int n_tokens
 ) {
@@ -419,17 +420,34 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
     ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
 
-    ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-        q35::HEAD_DIM, n_tokens, q35::N_HEAD_KV,
-        cache_k->nb[1], cache_k->nb[2],
-        /*offset*/ cache_k->nb[1] * kv_start);
-    ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-        q35::HEAD_DIM, n_tokens, q35::N_HEAD_KV,
-        cache_v->nb[1], cache_v->nb[2],
-        cache_v->nb[1] * kv_start);
-
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    // K-write: cpy onto a strided 3D view of the TQ3_0 cache silently
+    // corrupts blocks (cpy_blck reads 32 contiguous floats but the view
+    // makes the 32 elements span across rows). Use ggml_set_rows with the
+    // caller-supplied [n_tokens] i32 indices when the cache is quantized
+    // (also when kv_idxs is provided); fall back to the original cpy on
+    // f16/Q8_0 where strided cpy is well-tested.
+    const bool use_set_rows = (kv_idxs != nullptr) &&
+                              (cache_k->type == GGML_TYPE_TQ3_0 ||
+                               cache_v->type == GGML_TYPE_TQ3_0);
+    if (use_set_rows) {
+        Kcur_T = ggml_cont(ctx, Kcur_T);
+        Vcur_T = ggml_cont(ctx, Vcur_T);
+        // ggml_set_rows constraint: c->ne[0] == b->ne[1], c->ne[1]==1.
+        ggml_tensor * idx2d = ggml_reshape_2d(ctx, kv_idxs, n_tokens, 1);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_T, idx2d));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_T, idx2d));
+    } else {
+        ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+            q35::HEAD_DIM, n_tokens, q35::N_HEAD_KV,
+            cache_k->nb[1], cache_k->nb[2],
+            cache_k->nb[1] * kv_start);
+        ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+            q35::HEAD_DIM, n_tokens, q35::N_HEAD_KV,
+            cache_v->nb[1], cache_v->nb[2],
+            cache_v->nb[1] * kv_start);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    }
 
     // ── Flash attention over the valid slice [0, kv_start + n_tokens)
     const int kv_len = kv_start + n_tokens;
@@ -794,7 +812,8 @@ QwenGraphOutputs build_qwen35_graph(
         if (is_attn) {
             cur = build_full_attn_block(ctx, gf, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                        in.attn_mask, in.kv_start, n_tokens);
+                                        in.attn_mask, in.kv_idxs,
+                                        in.kv_start, n_tokens);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
