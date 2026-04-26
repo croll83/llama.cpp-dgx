@@ -215,6 +215,13 @@ bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t backend,
                             DraftWeights & out);
 
+// Same as load_draft_safetensors but for community GGUF quants (e.g.
+// spiritbuun/Qwen3.6-27B-DFlash-GGUF). Tensors retain their on-disk type
+// (Q8_0 for projections, F32 for norms); ggml_mul_mat handles Q8_0 src0.
+bool load_draft_gguf(const std::string & path,
+                     ggml_backend_t backend,
+                     DraftWeights & out);
+
 void free_draft_weights(DraftWeights & w);
 
 // ─── Target cache (persistent state between forward calls) ────────

@@ -21,6 +21,7 @@ add_library(${TARGET_LIB} STATIC
     errors.cpp
     gguf_target_loader.cpp
     safetensors_draft.cpp
+    gguf_draft_loader.cpp
     qwen35_target_graph.cpp
     qwen3_dflash_graph.cpp
     kv_cache.cpp

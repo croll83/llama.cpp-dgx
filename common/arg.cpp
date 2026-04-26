@@ -2343,7 +2343,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH"));
     add_opt(common_arg(
         {"--dflash-draft"}, "FILE",
-        "path to the DFlash draft model safetensors (required with --dflash)",
+        "path to the DFlash draft model (required with --dflash); accepts .safetensors (BF16) or .gguf (community quants like spiritbuun/Qwen3.6-27B-DFlash-GGUF)",
         [](common_params & params, const std::string & value) {
             params.dflash_draft = value;
             params.dflash = true;

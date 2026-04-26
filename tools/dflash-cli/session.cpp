@@ -843,6 +843,13 @@ extern "C" dflash_session_params_t dflash_session_default_params(void) {
     return p;
 }
 
+static bool path_is_gguf(const char * p) {
+    if (!p) return false;
+    const char * dot = std::strrchr(p, '.');
+    if (!dot) return false;
+    return std::string(dot) == ".gguf";
+}
+
 extern "C" dflash_weights_t * dflash_weights_load(const char * target_gguf,
                                                    const char * draft_safetensors,
                                                    ggml_backend_t backend) {
@@ -851,7 +858,10 @@ extern "C" dflash_weights_t * dflash_weights_load(const char * target_gguf,
     if (!load_target_gguf(target_gguf, backend, ws->w)) {
         delete ws; return nullptr;
     }
-    if (!load_draft_safetensors(draft_safetensors, backend, ws->dw)) {
+    bool draft_ok = path_is_gguf(draft_safetensors)
+                       ? load_draft_gguf(draft_safetensors, backend, ws->dw)
+                       : load_draft_safetensors(draft_safetensors, backend, ws->dw);
+    if (!draft_ok) {
         free_target_weights(ws->w);
         delete ws; return nullptr;
     }
@@ -869,7 +879,10 @@ extern "C" dflash_weights_t * dflash_weights_load_borrow(const struct llama_mode
     if (!load_target_from_llama_model(lm, path, backend, ws->w)) {
         delete ws; return nullptr;
     }
-    if (!load_draft_safetensors(draft_safetensors, backend, ws->dw)) {
+    bool draft_ok = path_is_gguf(draft_safetensors)
+                       ? load_draft_gguf(draft_safetensors, backend, ws->dw)
+                       : load_draft_safetensors(draft_safetensors, backend, ws->dw);
+    if (!draft_ok) {
         free_target_weights(ws->w);
         delete ws; return nullptr;
     }
