@@ -56,7 +56,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 | `-ctk tq3_0` / `-ctv tq3_0` | `llama-server`, `llama-cli` | Use TQ3_0 (3.5 bpw) for the standard llama_kv_cache K/V. Saves ~22% vs Q4_0; fattn vec kernel handles the 256-stride alignment. K=TQ3_0 is also wired (ours commit `7b5f82569`). |
 | `-ctk turbo3` etc. | (planned) | spiritbuun TurboQuant types for KV cache. Type names are exposed in `ggml.h` (`GGML_TYPE_TURBO2_0`, `TURBO3_0`, `TURBO4_0`, `TURBO3_TCQ`, `TURBO2_TCQ`) but the F32→TURBO* CPY/set-rows wiring is still TODO — see `docs/dflash_kv_quant_status.md`. |
 | `--dflash` | `llama-server` | Enable DFlash MTP speculative decoding. Replaces `llama_decode` with the dflash custom target graph for text-only requests; `mmproj` requests fall through to the standard path. |
-| `--dflash-draft PATH` | `llama-server` | Path to the DFlash draft `.safetensors` (Qwen3.6-27B-DFlash recommended for `Qwopus3.6` targets). |
+| `--dflash-draft PATH` | `llama-server` | Path to the DFlash draft model. Accepts `.safetensors` (BF16, ~3.3 GiB, default) or `.gguf` (community Q8_0 quants like [spiritbuun/Qwen3.6-27B-DFlash-GGUF](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF), ~1.8 GiB). Q8_0 GGUF saves ~1.5 GiB VRAM but trades ~16 % decode throughput and ~30 % accept rate vs BF16 in our dflash MTP rollback path — keep BF16 unless VRAM-constrained. |
 | `--dflash-budget N` | `llama-server` | DDtree node budget per draft step. Default 22; sweep summary: 22 is balanced, 32 wins on JSON (+25%), 64+ saturates. |
 | `--dflash-max-ctx N` | `llama-server` | Per-slot dflash KV ring size. Default `--ctx-size / n_parallel`. |
 | `--dflash-prefill-ubatch N` | `llama-server` | dflash prefill ubatch size. Default 192 on GB10. |
