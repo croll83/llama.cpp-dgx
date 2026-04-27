@@ -351,6 +351,7 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
+    int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     // DDTree extension: when non-null, the full-attention layers use the
     // caller-provided ancestor-only mask (same attn_mask field) and the
     // delta-net (gated_delta_net) kernel switches to tree mode via this i32

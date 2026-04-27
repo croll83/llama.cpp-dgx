@@ -358,7 +358,8 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * attn_mask,        // [kv_len, n_tokens] f32 or nullptr
     ggml_tensor * kv_idxs,          // [n_tokens] i32, set_rows index for TQ3_0 K
     int kv_start,
-    int n_tokens
+    int n_tokens,
+    int fa_window                   // sliding window: 0 = full attention
 ) {
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
@@ -449,8 +450,15 @@ static ggml_tensor * build_full_attn_block(
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
     }
 
-    // ── Flash attention over the valid slice [0, kv_start + n_tokens)
+    // ── Flash attention over the valid slice
+    // When fa_window > 0 and kv_start >= fa_window, only attend to the last
+    // fa_window positions. This dramatically reduces FA cost during speculative
+    // decode verify/replay at long contexts (60K+ kv entries). 100% acceptance
+    // preserved (Luce-Org/lucebox-hub PR #26 by dusterbloom).
+    const int win_start = (fa_window > 0 && kv_start > fa_window)
+                              ? (kv_start - fa_window) : 0;
     const int kv_len = kv_start + n_tokens;
+    const int win_len = kv_len - win_start;
 
     // FA kernel alignment requirements for the kv view length:
     //   - f16 / Q4_0 / Q8_0 paths: stride 1 (FA accepts any length)
@@ -467,21 +475,21 @@ static ggml_tensor * build_full_attn_block(
                t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
     };
     const int fattn_stride  = (needs_fa_stride_256(cache_k->type) || needs_fa_stride_256(cache_v->type)) ? 256 : 1;
-    const int kv_len_padded = ((kv_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
     // Q needs to be [head_dim, n_tokens, n_head] for flash_attn_ext
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);   // [head_dim, n_tokens, n_head]
     Qfa = ggml_cont(ctx, Qfa);
 
-    // K and V from cache: a view into the first kv_len_padded slots. For
-    // non-TBQ paths kv_len_padded == kv_len so this is identical to the
-    // old behaviour.
+    // K and V from cache: a windowed view starting at win_start.
+    // For fa_window=0 (or short prompts) win_start=0 and win_len_padded==kv_len_padded,
+    // identical to pre-PR-26 behaviour.
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        q35::HEAD_DIM, kv_len_padded, q35::N_HEAD_KV,
-        cache_k->nb[1], cache_k->nb[2], 0);
+        q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
+        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
     ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        q35::HEAD_DIM, kv_len_padded, q35::N_HEAD_KV,
-        cache_v->nb[1], cache_v->nb[2], 0);
+        q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
+        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
 
     // Causal mask: for n_tokens==1 we don't need one (a single query attending
     // to all keys is trivially causal). For n_tokens>1 the caller must provide
@@ -813,7 +821,7 @@ QwenGraphOutputs build_qwen35_graph(
             cur = build_full_attn_block(ctx, gf, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_idxs,
-                                        in.kv_start, n_tokens);
+                                        in.kv_start, n_tokens, in.fa_window);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

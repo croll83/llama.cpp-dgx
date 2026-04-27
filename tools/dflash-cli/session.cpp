@@ -116,14 +116,21 @@ static constexpr uint16_t F16_ZERO = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
 static void build_causal_mask(std::vector<uint16_t> & out,
-                              int kv_len, int n_tokens, int kv_start) {
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+                              int kv_len, int n_tokens, int kv_start,
+                              int win_start = 0) {
+    // SWA: when win_start > 0, mask is shaped for the windowed K/V view
+    // [win_len, q_pad]. Cell (q, k_local) maps to absolute KV slot
+    // (win_start + k_local). Positions before win_start are not in K/V view
+    // so they are simply omitted from the mask.
+    const int win_len = kv_len - win_start;
+    const int kv_pad = align_up(win_len, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < n_tokens; q++) {
         const int max_k = kv_start + q;
-        for (int k = 0; k <= max_k && k < kv_len; k++) {
-            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        const int k_from = win_start;
+        for (int k = k_from; k <= max_k && k < kv_len; k++) {
+            out[(size_t)q * kv_pad + (k - win_start)] = F16_ZERO;
         }
     }
 }
@@ -469,21 +476,26 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
 //                                     = -inf otherwise
 // Shape matches the ggml flash_attn_ext expectation: [kv_pad, q_pad] f16.
 static void build_tree_mask(const DDTree & tree, int past_length,
-                            std::vector<uint16_t> & out_mask) {
+                            std::vector<uint16_t> & out_mask,
+                            int win_start = 0) {
+    // SWA: same convention as build_causal_mask. Tree nodes [past_length, past_length+N)
+    // are always within the window (tree depth << 2048), past KV gets clamped to
+    // [win_start, past_length).
     const int N      = 1 + tree.n_nodes;
     const int kv_len = past_length + N;
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+    const int win_len = kv_len - win_start;
+    const int kv_pad = align_up(win_len, g_kq_stride_pad);
     const int q_pad  = align_up(N,      KQ_MASK_PAD);
     out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < N; q++) {
-        // Past KV (prompt + previously-committed decode tokens): always visible.
-        for (int k = 0; k < past_length; k++) {
-            out_mask[(size_t)q * kv_pad + k] = F16_ZERO;
+        // Past KV (within window): visible.
+        for (int k = std::max(0, win_start); k < past_length; k++) {
+            out_mask[(size_t)q * kv_pad + (k - win_start)] = F16_ZERO;
         }
         // Tree region: ancestors-only per the tree.visibility matrix.
         for (int j = 0; j < N; j++) {
             if (tree.visibility[(size_t)q * N + j]) {
-                out_mask[(size_t)q * kv_pad + (past_length + j)] = F16_ZERO;
+                out_mask[(size_t)q * kv_pad + (past_length + j - win_start)] = F16_ZERO;
             }
         }
     }
@@ -561,7 +573,8 @@ static bool build_target_step_tree(
     TargetCache & cache,
     ggml_backend_t backend,
     int kv_start,
-    int n_tokens);   // implemented below after the regular build_target_step
+    int n_tokens,
+    int fa_window = 0);   // implemented below after the regular build_target_step
 
 static bool build_target_step(
     StepGraph & sg,
@@ -572,7 +585,8 @@ static bool build_target_step(
     int n_tokens,
     bool with_mask,
     bool capture,
-    bool capture_delta_intermediate = false) {
+    bool capture_delta_intermediate = false,
+    int fa_window = 0) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -597,7 +611,12 @@ static bool build_target_step(
 
     if (with_mask) {
         const int kv_len = kv_start + n_tokens;
-        const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+        // SWA: when fa_window > 0 and we are past the window, allocate a smaller
+        // mask matching the windowed K/V view. fa_window=0 keeps full attention.
+        const int win_start = (fa_window > 0 && kv_start > fa_window)
+                                  ? (kv_start - fa_window) : 0;
+        const int win_len   = kv_len - win_start;
+        const int kv_pad = align_up(win_len, g_kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");
@@ -621,6 +640,7 @@ static bool build_target_step(
     gi.kv_start                   = kv_start;
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
+    gi.fa_window                  = fa_window;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -649,7 +669,8 @@ static bool build_target_step_tree(
     TargetCache & cache,
     ggml_backend_t backend,
     int kv_start,
-    int n_tokens) {
+    int n_tokens,
+    int fa_window) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -669,7 +690,10 @@ static bool build_target_step_tree(
     ggml_set_input(sg.positions);
 
     const int kv_len = kv_start + n_tokens;
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+    const int win_start = (fa_window > 0 && kv_start > fa_window)
+                              ? (kv_start - fa_window) : 0;
+    const int win_len   = kv_len - win_start;
+    const int kv_pad = align_up(win_len, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
     ggml_set_name(sg.attn_mask, "attn_mask");
@@ -698,6 +722,7 @@ static bool build_target_step_tree(
     gi.capture_layers             = true;
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
+    gi.fa_window                  = fa_window;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -840,6 +865,7 @@ extern "C" dflash_session_params_t dflash_session_default_params(void) {
     p.ddtree_temp       = 1.0f;
     p.kv_tbq            = 0;
     p.prefill_ubatch    = 0;
+    p.fa_window         = 0;  // 0 = full attention; set to 2048 (PR #26 default) for SWA speedup.
     return p;
 }
 
@@ -1215,7 +1241,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
                                 /*kv_start=*/abs_start, /*n_tokens=*/n_tokens,
-                                /*with_mask=*/pf_with_mask, /*capture=*/true)) {
+                                /*with_mask=*/pf_with_mask, /*capture=*/true,
+                                /*capture_delta_intermediate=*/false,
+                                /*fa_window=*/s->params.fa_window)) {
             std::fprintf(stderr, "prefill build @%d\n", abs_start); return 1;
         }
 
@@ -1250,7 +1278,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
         // is active (which pads kv_len to 256 and needs -inf on the padding
         // positions even for a single query).
         if (pf_with_mask) {
-            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/abs_start);
+            const int pf_win_start = (s->params.fa_window > 0 && abs_start > s->params.fa_window)
+                                         ? (abs_start - s->params.fa_window) : 0;
+            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/abs_start, pf_win_start);
             ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
                                     sizeof(uint16_t) * pf_mask_buf.size());
         }
@@ -1515,7 +1545,8 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             const int N = 1 + tree.n_nodes;  // flat size including root
 
             if (!build_target_step_tree(sg, w, cache, backend,
-                                        /*kv_start=*/committed, /*n_tokens=*/N)) {
+                                        /*kv_start=*/committed, /*n_tokens=*/N,
+                                        /*fa_window=*/s->params.fa_window)) {
                 std::fprintf(stderr, "ddtree verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -1544,7 +1575,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
 
             // Ancestor-only attention mask (f16).
-            build_tree_mask(tree, /*past_length=*/committed, mask_buf);
+            const int tree_win_start = (s->params.fa_window > 0 && committed > s->params.fa_window)
+                                           ? (committed - s->params.fa_window) : 0;
+            build_tree_mask(tree, /*past_length=*/committed, mask_buf, tree_win_start);
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
 
@@ -1818,7 +1851,8 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             if (!build_target_step(sg, w, cache, backend,
                                     /*kv_start=*/committed, /*n_tokens=*/q_len,
                                     /*with_mask=*/true, /*capture=*/true,
-                                    /*capture_delta_intermediate=*/fast_rollback)) {
+                                    /*capture_delta_intermediate=*/fast_rollback,
+                                    /*fa_window=*/s->params.fa_window)) {
                 std::fprintf(stderr, "verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -1845,7 +1879,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * q_len);
             }
 
-            build_causal_mask(mask_buf, committed + q_len, q_len, committed);
+            const int chain_win_start = (s->params.fa_window > 0 && committed > s->params.fa_window)
+                                            ? (committed - s->params.fa_window) : 0;
+            build_causal_mask(mask_buf, committed + q_len, q_len, committed, chain_win_start);
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
@@ -1871,7 +1907,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             for (int i = 0; i < q_len; i++) {
                 if (!build_target_step(sg, w, cache, backend,
                                         /*kv_start=*/committed + i, /*n_tokens=*/1,
-                                        /*with_mask=*/false, /*capture=*/true)) {
+                                        /*with_mask=*/false, /*capture=*/true,
+                                        /*capture_delta_intermediate=*/false,
+                                        /*fa_window=*/s->params.fa_window)) {
                     std::fprintf(stderr, "seq verify build %d failed\n", i); return 1;
                 }
                 int32_t t = draft_tok[i];
@@ -2076,7 +2114,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             bool replay_with_mask = (commit_n > 1);
             if (!build_target_step(sg, w, cache, backend,
                                     committed, commit_n,
-                                    replay_with_mask, /*capture=*/true)) {
+                                    replay_with_mask, /*capture=*/true,
+                                    /*capture_delta_intermediate=*/false,
+                                    /*fa_window=*/s->params.fa_window)) {
                 std::fprintf(stderr, "replay build failed\n"); return 1;
             }
             auto T_replay_build = sync_us();
@@ -2100,7 +2140,9 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * commit_n);
             }
             if (replay_with_mask) {
-                build_causal_mask(mask_buf, committed + commit_n, commit_n, committed);
+                const int ddreplay_win_start = (s->params.fa_window > 0 && committed > s->params.fa_window)
+                                               ? (committed - s->params.fa_window) : 0;
+                build_causal_mask(mask_buf, committed + commit_n, commit_n, committed, ddreplay_win_start);
                 ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             }
             auto T_replay_set = sync_us();

@@ -474,6 +474,7 @@ struct common_params {
     float       dflash_temp        = 1.0f;    // softmax temp for ddtree top-K
     bool        dflash_kv_tbq      = false;   // 1 = align mask stride to 256 (TBQ FA)
     int         dflash_prefill_ubatch = 0;    // 0 = auto (16 if <=2048, 192 else)
+    int         dflash_fa_window  = 0;        // sliding window for FA layers (0 = full attn). PR #26 default 2048.
 
     struct common_params_model model;
 

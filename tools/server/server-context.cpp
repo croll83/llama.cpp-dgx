@@ -928,6 +928,7 @@ private:
                 dp.ddtree_temp       = params_base.dflash_temp;
                 dp.kv_tbq            = params_base.dflash_kv_tbq ? 1 : 0;
                 dp.prefill_ubatch    = params_base.dflash_prefill_ubatch;
+                dp.fa_window         = params_base.dflash_fa_window;
                 slot.dflash_session = dflash_session_create_shared(
                     dflash_weights, &dp, dflash_backend);
                 if (!slot.dflash_session) {
@@ -935,8 +936,8 @@ private:
                             i, dflash27b_last_error());
                     return false;
                 }
-                SLT_INF(slot, "DFlash session ready (budget=%d, max_ctx=%d)\n",
-                        dp.ddtree_budget, dp.max_ctx);
+                SLT_INF(slot, "DFlash session ready (budget=%d, max_ctx=%d, fa_window=%d)\n",
+                        dp.ddtree_budget, dp.max_ctx, dp.fa_window);
             }
 
             slots.push_back(std::move(slot));

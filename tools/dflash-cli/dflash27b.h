@@ -71,6 +71,7 @@ typedef struct {
     float ddtree_temp;          // softmax temperature for top-K draft extraction
     int   kv_tbq;               // 1 = align mask stride to 256 (TBQ FA kernels)
     int   prefill_ubatch;       // 0 = auto (16 for <=2048 prompts, 192 otherwise)
+    int   fa_window;            // sliding window for FA layers (0 = full attn). PR #26 default 2048.
 } dflash_session_params_t;
 
 // Sensible defaults matching lucebox test_dflash --fast-rollback --ddtree --ddtree-budget=22.

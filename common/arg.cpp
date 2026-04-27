@@ -2385,6 +2385,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.dflash_prefill_ubatch = value > 0 ? value : 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_PREFILL_UBATCH"));
+    add_opt(common_arg(
+        {"--dflash-fa-window"}, "N",
+        "DFlash sliding window flash attention (PR #26): limit FA to last N KV positions on full-attn layers (0 = full attention; recommended 2048). Cuts decode FA cost from O(kv_len) to O(N) at long contexts. 100% speculative acceptance preserved.",
+        [](common_params & params, int value) {
+            params.dflash_fa_window = value > 0 ? value : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_FA_WINDOW"));
 
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
