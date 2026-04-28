@@ -506,15 +506,16 @@ static ggml_tensor * build_full_attn_block(
         const int total_target = ((sink_padded + win_seg_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
         const int win_seg_padded = total_target - sink_padded;
 
-        // Allocate K_combined / V_combined as F32 (verified semantically correct).
-        // The Q*->Q* same-type cpy via cpy_q_f32 template was tried and produced
-        // garbage output — the template assumes F32-element dst arithmetic which
-        // breaks on block-quantised destinations. Same-type cpy needs a block-aware
-        // scalar variant, kept as TODO. F32 dest works via existing Q*->F32 dequant
-        // cpy kernels (TQ3 added by us in this branch).
-        ggml_tensor * K_combined = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+        // Allocate K_combined / V_combined in the cache's NATIVE quantised type
+        // (Q8_0 / TQ3_0). Same-type cpy is dispatched via the new cpy_q_q template
+        // in cpy.cu which uses block-stride math for BOTH src and dst, so the per-block
+        // memcpy is correct (cpy_q_f32 was wrong because it used element-stride for dst).
+        // Native-type K_combined keeps flash_attn_ext on the optimised FA-VEC kernel
+        // path (Q8/TQ3 dequant on the fly during attention compute), avoiding the
+        // 4x memory bandwidth + slow F32 FA cost we hit with the F32 fallback.
+        ggml_tensor * K_combined = ggml_new_tensor_3d(ctx, cache_k->type,
             q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
-        ggml_tensor * V_combined = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+        ggml_tensor * V_combined = ggml_new_tensor_3d(ctx, cache_v->type,
             q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
 
         // Sink slot: positions 0..sink_padded (in combined tensor)

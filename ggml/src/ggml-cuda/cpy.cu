@@ -171,6 +171,32 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst, const int64_t ne,
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
+// Same-type quantised block copy (Q8_0 -> Q8_0, TQ3_0 -> TQ3_0, ...).
+// Differs from cpy_q_f32 only in the dst stride: both src AND dst use block-stride math
+// since both tensors are quantised. cpy_blck performs raw memcpy of one block.
+template <cpy_kernel_t cpy_blck, int qk>
+static __global__ void cpy_q_q(const char * cx, char * cdst, const int64_t ne,
+                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                const int64_t nb12, const int64_t nb13) {
+    const int64_t i = ((int64_t)blockDim.x*blockIdx.x + threadIdx.x)*qk;
+    if (i >= ne) return;
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02) / (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02 - i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = (i00/qk)*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = (i10/qk)*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    cpy_blck(cx + x_offset, cdst + dst_offset);
+}
+
 template<typename src_t, typename dst_t>
 static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const int64_t ne) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
@@ -242,6 +268,40 @@ static void ggml_cpy_f32_q8_0_cuda(
     const int64_t num_blocks = ne / QK8_0;
     GGML_ASSERT(num_blocks < UINT_MAX);
     cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, 1, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+// Same-type quantised block memcpy (Q8_0->Q8_0, TQ3_0->TQ3_0). Each cpy_blck
+// runs in a single CUDA thread per quant block; cpy_q_q kernel walks i in
+// block-stride for both src and dst. Used by the dflash sink path so K_combined /
+// V_combined stay in the cache's native quant type and FA-VEC kernels apply.
+static __device__ void cpy_blck_q8_0_q8_0(const char * cxi, char * cdsti) {
+    *((block_q8_0 *)cdsti) = *((const block_q8_0 *)cxi);
+}
+static __device__ void cpy_blck_tq3_0_tq3_0(const char * cxi, char * cdsti) {
+    *((block_tq3_0 *)cdsti) = *((const block_tq3_0 *)cxi);
+}
+
+static void ggml_cpy_q8_0_q8_0_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+    const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+    GGML_ASSERT(ne % QK8_0 == 0);
+    const int64_t num_blocks = ne / QK8_0;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_q_q<cpy_blck_q8_0_q8_0, QK8_0><<<num_blocks, 1, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+static void ggml_cpy_tq3_0_tq3_0_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+    const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+    GGML_ASSERT(ne % QK_TQ3_0 == 0);
+    const int64_t num_blocks = ne / QK_TQ3_0;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_q_q<cpy_blck_tq3_0_tq3_0, QK_TQ3_0><<<num_blocks, 1, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -529,6 +589,12 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_tq3_0_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0) {
+        ggml_cpy_q8_0_q8_0_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_TQ3_0) {
+        ggml_cpy_tq3_0_tq3_0_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q5_1) {
         ggml_cpy_f32_q5_1_cuda
