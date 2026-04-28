@@ -252,7 +252,7 @@ struct TargetCache {
     // sink_built_for_lcp[fa_idx]:
     //   -1 = sink portion not built / invalidated, must rebuild
     //    K (>= fa_sink_padded) = sink portion contains a valid copy of cache_k[0..K)
-    static constexpr int MAX_FA_WINDOW_PLUS_TOKENS = 8192;
+    static constexpr int MAX_FA_WINDOW_PLUS_TOKENS = 32768;
     std::vector<ggml_tensor *> attn_k_combined;   // size = n_full_attn_layers
     std::vector<ggml_tensor *> attn_v_combined;
     std::vector<int>           sink_built_for_lcp;
