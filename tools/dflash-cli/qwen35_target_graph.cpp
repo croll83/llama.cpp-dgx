@@ -506,11 +506,12 @@ static ggml_tensor * build_full_attn_block(
         const int total_target = ((sink_padded + win_seg_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
         const int win_seg_padded = total_target - sink_padded;
 
-        // Allocate K_combined / V_combined as F32. ggml_cuda_cpy supports
-        // Q8_0/Q4_0/.../TQ3_0 -> F32 (the latter added by our cpy.cu patch). The dequant
-        // copy here is the "sink/window assembly" cost: ~(sink+window) blocks decoded
-        // per FA call, independent of kv_len. F32 dest is what flash_attn_ext expects
-        // when src is dequantised.
+        // Allocate K_combined / V_combined as F32 (verified semantically correct).
+        // The Q*->Q* same-type cpy via cpy_q_f32 template was tried and produced
+        // garbage output — the template assumes F32-element dst arithmetic which
+        // breaks on block-quantised destinations. Same-type cpy needs a block-aware
+        // scalar variant, kept as TODO. F32 dest works via existing Q*->F32 dequant
+        // cpy kernels (TQ3 added by us in this branch).
         ggml_tensor * K_combined = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
             q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
         ggml_tensor * V_combined = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
