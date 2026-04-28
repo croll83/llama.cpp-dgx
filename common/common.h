@@ -475,6 +475,7 @@ struct common_params {
     bool        dflash_kv_tbq      = false;   // 1 = align mask stride to 256 (TBQ FA)
     int         dflash_prefill_ubatch = 0;    // 0 = auto (16 if <=2048, 192 else)
     int         dflash_fa_window  = 0;        // sliding window for FA layers (0 = full attn). PR #26 default 2048.
+    int         dflash_fa_sink    = 0;        // attention sinks: keep first K KV positions always visible (Xiao 2023). 0 = no sink.
 
     struct common_params_model model;
 

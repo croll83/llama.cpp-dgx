@@ -2392,6 +2392,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.dflash_fa_window = value > 0 ? value : 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_FA_WINDOW"));
+    add_opt(common_arg(
+        {"--dflash-fa-sink"}, "N",
+        "DFlash attention sinks (Xiao 2023): always keep first N KV positions visible to attention regardless of fa_window (0 = no sink). Combined with --dflash-fa-window, builds K/V as concat(sink_view, window_view) so the system prompt + tools never drop out of attention on agent workloads. Recommended for Dark Jarvis: --dflash-fa-sink 16384 --dflash-fa-window 4096.",
+        [](common_params & params, int value) {
+            params.dflash_fa_sink = value > 0 ? value : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_FA_SINK"));
 
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(

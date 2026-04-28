@@ -359,7 +359,8 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * kv_idxs,          // [n_tokens] i32, set_rows index for TQ3_0 K
     int kv_start,
     int n_tokens,
-    int fa_window                   // sliding window: 0 = full attention
+    int fa_window,                  // sliding window: 0 = full attention
+    int fa_sink                     // attention sinks: keep first K KV positions visible (Xiao 2023). 0 = no sink.
 ) {
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
@@ -450,14 +451,26 @@ static ggml_tensor * build_full_attn_block(
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
     }
 
-    // ── Flash attention over the valid slice
-    // When fa_window > 0 and kv_start >= fa_window, only attend to the last
-    // fa_window positions. This dramatically reduces FA cost during speculative
-    // decode verify/replay at long contexts (60K+ kv entries). 100% acceptance
-    // preserved (Luce-Org/lucebox-hub PR #26 by dusterbloom).
-    const int win_start = (fa_window > 0 && kv_start > fa_window)
-                              ? (kv_start - fa_window) : 0;
+    // ── Flash attention slicing
+    //
+    // 1) fa_window > 0, fa_sink == 0  → standard SWA (last fa_window positions). Ours commit a19e198c6.
+    //    Drops everything before kv_start - fa_window from attention.
+    // 2) fa_sink > 0, fa_window > 0    → attention sinks (Xiao 2023 + Luce PR #26 follow-up):
+    //    K/V exposed to FA = concat(sink_view[0..fa_sink], window_view[kv_start-fa_window..kv_start+n_tokens]).
+    //    Keeps the system prompt + tool definitions (first ~fa_sink positions) attendable while
+    //    still bounding FA cost to O(fa_sink + fa_window) at long contexts. Required for agent
+    //    workloads (Dark Jarvis SOUL.md) where dropping the system prompt = identity loss.
+    // 3) fa_window == 0                → full attention (default, pre-PR-26 behaviour).
     const int kv_len = kv_start + n_tokens;
+    const bool use_sink =
+        (fa_sink > 0 && fa_window > 0 && kv_start > fa_sink + fa_window);
+    // When fa_sink is configured but threshold not met, force FULL attention
+    // (win_start=0). Plain SWA would drop the system prompt — fa_sink>0 is the
+    // user opt-in to "keep system prompt visible until fa_sink+fa_window threshold,
+    // then switch to sink+window".
+    const int win_start = use_sink
+                              ? (kv_start - fa_window)
+                              : ((fa_sink == 0 && fa_window > 0 && kv_start > fa_window) ? (kv_start - fa_window) : 0);
     const int win_len = kv_len - win_start;
 
     // FA kernel alignment requirements for the kv view length:
@@ -481,15 +494,73 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);   // [head_dim, n_tokens, n_head]
     Qfa = ggml_cont(ctx, Qfa);
 
-    // K and V from cache: a windowed view starting at win_start.
-    // For fa_window=0 (or short prompts) win_start=0 and win_len_padded==kv_len_padded,
-    // identical to pre-PR-26 behaviour.
-    ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
-        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
-    ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
-        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
+    ggml_tensor * Kfa;
+    ggml_tensor * Vfa;
+    if (use_sink) {
+        // Two-segment view: sink [0..fa_sink) + window [win_start..win_start+win_seg_len).
+        // ggml_concat is F32-only on CUDA, so we build the combined K/V via two
+        // ggml_cpy ops into a freshly-allocated tensor of the same quantised type.
+        // Cost: dequant-free Q*->Q* memcpy of (sink + window) blocks per step.
+        const int win_seg_len = win_len;  // window segment length INCLUDING new tokens
+        const int sink_padded = ((fa_sink + fattn_stride - 1) / fattn_stride) * fattn_stride;
+        const int total_target = ((sink_padded + win_seg_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+        const int win_seg_padded = total_target - sink_padded;
+
+        // Allocate K_combined / V_combined as F32. ggml_cuda_cpy supports
+        // Q8_0/Q4_0/.../TQ3_0 -> F32 (the latter added by our cpy.cu patch). The dequant
+        // copy here is the "sink/window assembly" cost: ~(sink+window) blocks decoded
+        // per FA call, independent of kv_len. F32 dest is what flash_attn_ext expects
+        // when src is dequantised.
+        ggml_tensor * K_combined = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+            q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
+        ggml_tensor * V_combined = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+            q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
+
+        // Sink slot: positions 0..sink_padded (in combined tensor)
+        ggml_tensor * K_sink_view = ggml_view_3d(ctx, cache_k,
+            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+            cache_k->nb[1], cache_k->nb[2], 0);
+        ggml_tensor * K_sink_slot = ggml_view_3d(ctx, K_combined,
+            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+            K_combined->nb[1], K_combined->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, K_sink_view, K_sink_slot));
+
+        ggml_tensor * V_sink_view = ggml_view_3d(ctx, cache_v,
+            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+            cache_v->nb[1], cache_v->nb[2], 0);
+        ggml_tensor * V_sink_slot = ggml_view_3d(ctx, V_combined,
+            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+            V_combined->nb[1], V_combined->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, V_sink_view, V_sink_slot));
+
+        // Window slot: positions sink_padded..sink_padded+win_seg_padded (in combined)
+        ggml_tensor * K_win_view = ggml_view_3d(ctx, cache_k,
+            q35::HEAD_DIM, win_seg_padded, q35::N_HEAD_KV,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
+        ggml_tensor * K_win_slot = ggml_view_3d(ctx, K_combined,
+            q35::HEAD_DIM, win_seg_padded, q35::N_HEAD_KV,
+            K_combined->nb[1], K_combined->nb[2], K_combined->nb[1] * sink_padded);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, K_win_view, K_win_slot));
+
+        ggml_tensor * V_win_view = ggml_view_3d(ctx, cache_v,
+            q35::HEAD_DIM, win_seg_padded, q35::N_HEAD_KV,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
+        ggml_tensor * V_win_slot = ggml_view_3d(ctx, V_combined,
+            q35::HEAD_DIM, win_seg_padded, q35::N_HEAD_KV,
+            V_combined->nb[1], V_combined->nb[2], V_combined->nb[1] * sink_padded);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, V_win_view, V_win_slot));
+
+        Kfa = K_combined;
+        Vfa = V_combined;
+    } else {
+        // Single windowed view (or full attention when fa_window=0 / kv_start <= fa_window).
+        Kfa = ggml_view_3d(ctx, cache_k,
+            q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
+        Vfa = ggml_view_3d(ctx, cache_v,
+            q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
+    }
 
     // Causal mask: for n_tokens==1 we don't need one (a single query attending
     // to all keys is trivially causal). For n_tokens>1 the caller must provide
@@ -821,7 +892,7 @@ QwenGraphOutputs build_qwen35_graph(
             cur = build_full_attn_block(ctx, gf, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_idxs,
-                                        in.kv_start, n_tokens, in.fa_window);
+                                        in.kv_start, n_tokens, in.fa_window, in.fa_sink);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

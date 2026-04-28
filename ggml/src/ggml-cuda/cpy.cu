@@ -245,6 +245,50 @@ static void ggml_cpy_f32_q8_0_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+// Centroids duplicated from convert.cu (file-local __constant__ there).
+__constant__ static const float tq3_0_centroids_cpy[8] = {
+    -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+     0.230106f,  0.725222f,  1.277503f,  1.988943f
+};
+
+// Per-block TQ3_0 -> F32 dequantize copy (single thread, contiguous F32 dest).
+// Layout matches dequantize_block_tq3_0 in convert.cu: 32 quants per block,
+// 3 bits each, packed 8 quants per 3 bytes (4 groups). y[j] = centroid[idx] * d.
+static __device__ void cpy_blck_tq3_0_f32(const char * cxi, char * cdsti) {
+    const block_tq3_0 * x = (const block_tq3_0 *) cxi;
+    float * cdstf = (float *) cdsti;
+    const float d = __half2float(x->d);
+    #pragma unroll
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        const int g = j / 8;
+        const int r = j % 8;
+        const uint8_t * qp = x->qs + g * 3;
+        uint8_t idx;
+        switch (r) {
+            case 0: idx =  qp[0]       & 7; break;
+            case 1: idx = (qp[0] >> 3) & 7; break;
+            case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
+            case 3: idx = (qp[1] >> 1) & 7; break;
+            case 4: idx = (qp[1] >> 4) & 7; break;
+            case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
+            case 6: idx = (qp[2] >> 2) & 7; break;
+            default: idx = (qp[2] >> 5) & 7; break;
+        }
+        cdstf[j] = tq3_0_centroids_cpy[idx] * d;
+    }
+}
+
+static void ggml_cpy_tq3_0_f32_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+    const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+    const int64_t num_blocks = ne;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_q_f32<cpy_blck_tq3_0_f32, QK_TQ3_0><<<num_blocks, 1, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
 static void ggml_cpy_q8_0_f32_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -482,6 +526,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TQ3_0) {
         ggml_cpy_f32_tq3_0_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_tq3_0_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q5_1) {
         ggml_cpy_f32_q5_1_cuda
