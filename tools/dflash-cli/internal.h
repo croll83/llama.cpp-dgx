@@ -242,6 +242,22 @@ struct TargetCache {
     std::vector<ggml_tensor *> attn_k;   // size = n_full_attn_layers (16)
     std::vector<ggml_tensor *> attn_v;
 
+    // Persistent K_combined / V_combined tensors for the attention-sink path.
+    // Each is shape [HEAD_DIM, fa_sink_padded + MAX_FA_WINDOW_PLUS_TOKENS, N_HEAD_KV]
+    // in the cache's native quant type. Sink portion (positions 0..fa_sink_padded)
+    // is populated lazily and reused across decode steps until invalidated by a
+    // new prefill below fa_sink. Window portion (positions fa_sink_padded..end)
+    // is rebuilt every call to track the sliding window.
+    //
+    // sink_built_for_lcp[fa_idx]:
+    //   -1 = sink portion not built / invalidated, must rebuild
+    //    K (>= fa_sink_padded) = sink portion contains a valid copy of cache_k[0..K)
+    static constexpr int MAX_FA_WINDOW_PLUS_TOKENS = 8192;
+    std::vector<ggml_tensor *> attn_k_combined;   // size = n_full_attn_layers
+    std::vector<ggml_tensor *> attn_v_combined;
+    std::vector<int>           sink_built_for_lcp;
+    int                        sink_padded_alloc = 0;  // fa_sink_padded at create_target_cache time
+
     // Gated DeltaNet recurrent state: one per delta-net layer.
     // ssm_state: [S_v, S_v, H_v] f32    (head_v_dim^2 × num_v_heads)
     // conv_state: [(kernel-1), conv_channels] f32
@@ -317,7 +333,8 @@ bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
-                         TargetCache & out);
+                         TargetCache & out,
+                         int fa_sink_padded = 0);
 
 void free_target_cache(TargetCache & c);
 

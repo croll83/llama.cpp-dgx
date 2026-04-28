@@ -1016,8 +1016,10 @@ extern "C" dflash_session_t * dflash_session_create_shared(dflash_weights_t * we
         ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, s->params.ddtree_budget + 1)
         : DFLASH27B_DRAFT_BLOCK_SIZE;
 
+    const int sink_pad = (s->params.fa_sink > 0)
+                                ? ((s->params.fa_sink + 255) / 256) * 256 : 0;
     if (!create_target_cache(weights->w, s->max_ctx, s->max_verify_tokens,
-                             backend, s->cache)) {
+                             backend, s->cache, sink_pad)) {
         delete s;
         return nullptr;
     }
@@ -1059,8 +1061,10 @@ extern "C" int dflash_session_reset(dflash_session_t * s) {
     step_graph_free(s->sg);
     s->sg = StepGraph{};
     free_target_cache(s->cache);
+    const int sink_pad_reset = (s->params.fa_sink > 0)
+                                ? ((s->params.fa_sink + 255) / 256) * 256 : 0;
     if (!create_target_cache(s->weights->w, s->max_ctx, s->max_verify_tokens,
-                             s->backend, s->cache)) {
+                             s->backend, s->cache, sink_pad_reset)) {
         return -1;
     }
     s->kv_end     = 0;

@@ -72,10 +72,12 @@ bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
-                         TargetCache & out) {
+                         TargetCache & out,
+                         int fa_sink_padded) {
     out.backend = backend;
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
+    out.sink_padded_alloc = fa_sink_padded;
     if (max_verify_tokens <= 0) {
         max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     }
@@ -85,6 +87,9 @@ bool create_target_cache(const TargetWeights & w,
 
     out.attn_k.assign(n_full_attn, nullptr);
     out.attn_v.assign(n_full_attn, nullptr);
+    out.attn_k_combined.assign(n_full_attn, nullptr);
+    out.attn_v_combined.assign(n_full_attn, nullptr);
+    out.sink_built_for_lcp.assign(n_full_attn, -1);
     out.ssm_state.assign(n_delta, nullptr);
     out.conv_state.assign(n_delta, nullptr);
     out.ssm_state_snap.assign(n_delta, nullptr);
@@ -96,12 +101,13 @@ bool create_target_cache(const TargetWeights & w,
     out.conv_input_cache.assign(n_delta, nullptr);
 
     // Size the cache ggml context to hold all state tensors.
-    //   per full-attn layer  : 2 (K, V)
+    //   per full-attn layer  : 2 (K, V) + 2 if fa_sink_padded > 0 (K_sink, V_sink)
     //   per delta-net layer  : 6 + 2*K (ssm, conv, ssm_snap, conv_snap,
     //                             K × ssm_anchor, K × conv_anchor,
     //                             ssm_intermediate, conv_input_cache)
     //   top-level            : 1 (target_feat)
-    const int n_tensors = 2 * n_full_attn + (6 + 2 * TargetCache::DFLASH_ANCHOR_SLOTS) * n_delta + 1;
+    const int sink_tensors_per_layer = (fa_sink_padded > 0) ? 2 : 0;
+    const int n_tensors = (2 + sink_tensors_per_layer) * n_full_attn + (6 + 2 * TargetCache::DFLASH_ANCHOR_SLOTS) * n_delta + 1;
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(n_tensors + 32) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -157,6 +163,21 @@ bool create_target_cache(const TargetWeights & w,
             ggml_set_name(V, name);
             out.attn_k[fa_idx] = K;
             out.attn_v[fa_idx] = V;
+
+            // Persistent K_combined / V_combined for the attention-sink path.
+            // Sized to hold sink + max window + spec-decode tokens. Sink portion is
+            // reused across decode steps; window portion is rebuilt every call.
+            if (fa_sink_padded > 0) {
+                const int combined_len = fa_sink_padded + TargetCache::MAX_FA_WINDOW_PLUS_TOKENS;
+                ggml_tensor * Kc = ggml_new_tensor_3d(out.ctx, kv_k_type,
+                                                      q35::HEAD_DIM, combined_len, q35::N_HEAD_KV);
+                ggml_tensor * Vc = ggml_new_tensor_3d(out.ctx, kv_v_type,
+                                                      q35::HEAD_DIM, combined_len, q35::N_HEAD_KV);
+                std::snprintf(name, sizeof(name), "cache_k_combined_%d", il); ggml_set_name(Kc, name);
+                std::snprintf(name, sizeof(name), "cache_v_combined_%d", il); ggml_set_name(Vc, name);
+                out.attn_k_combined[fa_idx] = Kc;
+                out.attn_v_combined[fa_idx] = Vc;
+            }
             fa_idx++;
         } else {
             // ssm_state: [head_v_dim, head_v_dim, num_v_heads]
@@ -281,6 +302,10 @@ void free_target_cache(TargetCache & c) {
     c.conv_input_cache.clear();
     c.target_feat = nullptr;
     c.cur_pos = 0;
+    c.attn_k_combined.clear();
+    c.attn_v_combined.clear();
+    c.sink_built_for_lcp.clear();
+    c.sink_padded_alloc = 0;
 }
 
 // Snapshot/restore SSM+conv state for speculative rollback. Uses device-side
@@ -360,7 +385,9 @@ static ggml_tensor * build_full_attn_block(
     int kv_start,
     int n_tokens,
     int fa_window,                  // sliding window: 0 = full attention
-    int fa_sink                     // attention sinks: keep first K KV positions visible (Xiao 2023). 0 = no sink.
+    int fa_sink,                    // attention sinks: keep first K KV positions visible (Xiao 2023). 0 = no sink.
+    TargetCache * cache_ref,        // for K_combined persistent + sink_built_for_lcp tracking
+    int fa_idx                      // index into cache_ref->attn_k_combined / sink_built_for_lcp
 ) {
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
@@ -451,6 +478,14 @@ static ggml_tensor * build_full_attn_block(
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
     }
 
+    // Invalidate sink cache if THIS write touches positions < fa_sink (e.g. cold
+    // prefill or LCP-divergent re-prefill from server-side cache reuse). Done in
+    // CPU code at graph build time — the actual cache_k/cache_v writes scheduled
+    // above will land before any subsequent sink-portion read.
+    if (cache_ref && fa_sink > 0 && kv_start < fa_sink && cache_ref->sink_built_for_lcp.size() > (size_t) fa_idx) {
+        cache_ref->sink_built_for_lcp[fa_idx] = -1;
+    }
+
     // ── Flash attention slicing
     //
     // 1) fa_window > 0, fa_sink == 0  → standard SWA (last fa_window positions). Ours commit a19e198c6.
@@ -497,45 +532,46 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * Kfa;
     ggml_tensor * Vfa;
     if (use_sink) {
-        // Two-segment view: sink [0..fa_sink) + window [win_start..win_start+win_seg_len).
-        // ggml_concat is F32-only on CUDA, so we build the combined K/V via two
-        // ggml_cpy ops into a freshly-allocated tensor of the same quantised type.
-        // Cost: dequant-free Q*->Q* memcpy of (sink + window) blocks per step.
+        // Persistent K_combined/V_combined in cache_buf (allocated in create_target_cache).
+        // Sink portion (positions 0..sink_padded) reused across decode steps when
+        // sink_built_for_lcp[fa_idx] >= sink_padded. Window portion rebuilt every call.
         const int win_seg_len = win_len;  // window segment length INCLUDING new tokens
         const int sink_padded = ((fa_sink + fattn_stride - 1) / fattn_stride) * fattn_stride;
         const int total_target = ((sink_padded + win_seg_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
         const int win_seg_padded = total_target - sink_padded;
 
-        // Allocate K_combined / V_combined in the cache's NATIVE quantised type
-        // (Q8_0 / TQ3_0). Same-type cpy is dispatched via the new cpy_q_q template
-        // in cpy.cu which uses block-stride math for BOTH src and dst, so the per-block
-        // memcpy is correct (cpy_q_f32 was wrong because it used element-stride for dst).
-        // Native-type K_combined keeps flash_attn_ext on the optimised FA-VEC kernel
-        // path (Q8/TQ3 dequant on the fly during attention compute), avoiding the
-        // 4x memory bandwidth + slow F32 FA cost we hit with the F32 fallback.
-        ggml_tensor * K_combined = ggml_new_tensor_3d(ctx, cache_k->type,
-            q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
-        ggml_tensor * V_combined = ggml_new_tensor_3d(ctx, cache_v->type,
-            q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV);
+        GGML_ASSERT(cache_ref && cache_ref->attn_k_combined.size() > (size_t) fa_idx
+                    && cache_ref->attn_k_combined[fa_idx]
+                    && "sink path requires cache_ref with attn_k_combined allocated (fa_sink_padded > 0 in create_target_cache)");
+        ggml_tensor * K_combined = cache_ref->attn_k_combined[fa_idx];
+        ggml_tensor * V_combined = cache_ref->attn_v_combined[fa_idx];
 
-        // Sink slot: positions 0..sink_padded (in combined tensor)
-        ggml_tensor * K_sink_view = ggml_view_3d(ctx, cache_k,
-            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
-            cache_k->nb[1], cache_k->nb[2], 0);
-        ggml_tensor * K_sink_slot = ggml_view_3d(ctx, K_combined,
-            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
-            K_combined->nb[1], K_combined->nb[2], 0);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, K_sink_view, K_sink_slot));
+        // Bounds: ensure win_seg_padded fits the persistent buffer slack.
+        GGML_ASSERT(sink_padded + win_seg_padded <= K_combined->ne[1]
+                    && "K_combined too small for sink_padded + win_seg_padded; bump TargetCache::MAX_FA_WINDOW_PLUS_TOKENS");
 
-        ggml_tensor * V_sink_view = ggml_view_3d(ctx, cache_v,
-            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
-            cache_v->nb[1], cache_v->nb[2], 0);
-        ggml_tensor * V_sink_slot = ggml_view_3d(ctx, V_combined,
-            q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
-            V_combined->nb[1], V_combined->nb[2], 0);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, V_sink_view, V_sink_slot));
+        // Sink portion: rebuild if invalidated, otherwise reuse persistent data.
+        const bool sink_stale = cache_ref->sink_built_for_lcp[fa_idx] < sink_padded;
+        if (sink_stale) {
+            ggml_tensor * K_sink_view = ggml_view_3d(ctx, cache_k,
+                q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+                cache_k->nb[1], cache_k->nb[2], 0);
+            ggml_tensor * K_sink_slot = ggml_view_3d(ctx, K_combined,
+                q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+                K_combined->nb[1], K_combined->nb[2], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, K_sink_view, K_sink_slot));
 
-        // Window slot: positions sink_padded..sink_padded+win_seg_padded (in combined)
+            ggml_tensor * V_sink_view = ggml_view_3d(ctx, cache_v,
+                q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+                cache_v->nb[1], cache_v->nb[2], 0);
+            ggml_tensor * V_sink_slot = ggml_view_3d(ctx, V_combined,
+                q35::HEAD_DIM, sink_padded, q35::N_HEAD_KV,
+                V_combined->nb[1], V_combined->nb[2], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, V_sink_view, V_sink_slot));
+            cache_ref->sink_built_for_lcp[fa_idx] = sink_padded;
+        }
+
+        // Window portion: always rebuild (sliding window).
         ggml_tensor * K_win_view = ggml_view_3d(ctx, cache_k,
             q35::HEAD_DIM, win_seg_padded, q35::N_HEAD_KV,
             cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
@@ -552,8 +588,13 @@ static ggml_tensor * build_full_attn_block(
             V_combined->nb[1], V_combined->nb[2], V_combined->nb[1] * sink_padded);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, V_win_view, V_win_slot));
 
-        Kfa = K_combined;
-        Vfa = V_combined;
+        // FA reads from K_combined / V_combined directly (sized to total_target rows).
+        Kfa = ggml_view_3d(ctx, K_combined,
+            q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV,
+            K_combined->nb[1], K_combined->nb[2], 0);
+        Vfa = ggml_view_3d(ctx, V_combined,
+            q35::HEAD_DIM, sink_padded + win_seg_padded, q35::N_HEAD_KV,
+            V_combined->nb[1], V_combined->nb[2], 0);
     } else {
         // Single windowed view (or full attention when fa_window=0 / kv_start <= fa_window).
         Kfa = ggml_view_3d(ctx, cache_k,
@@ -894,7 +935,8 @@ QwenGraphOutputs build_qwen35_graph(
             cur = build_full_attn_block(ctx, gf, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_idxs,
-                                        in.kv_start, n_tokens, in.fa_window, in.fa_sink);
+                                        in.kv_start, n_tokens, in.fa_window, in.fa_sink,
+                                        &cache, fa_idx);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
