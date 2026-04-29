@@ -83,6 +83,9 @@ dflash_session_params_t dflash_session_default_params(void);
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 
+// Forward decl — borrow-KV API takes ggml tensor pointers.
+struct ggml_tensor;
+
 // Create a session bound to the given target GGUF and draft safetensors
 // file. The session internally owns the weights and frees them on destroy.
 // Convenience wrapper over dflash_weights_load + dflash_session_create_shared;
@@ -125,6 +128,38 @@ void dflash_weights_free(dflash_weights_t * w);
 dflash_session_t * dflash_session_create_shared(dflash_weights_t * weights,
                                                  const dflash_session_params_t * params,
                                                  ggml_backend_t backend);
+
+// Same as dflash_session_create_shared but with the target K/V cache
+// borrowed from an external buffer — typically the slot's
+// llama_kv_cache layers shared with the standard mmproj/vision path.
+//
+// `external_K` and `external_V` must each be exactly n_full_attn_layers
+// long (16 for Qwen3.6-27B). Each entry is the per-layer K/V tensor in
+// the host-owned cache, with logical layout `[head_dim*n_kv_heads, max_ctx,
+// n_stream]` (= the standard llama_kv_cache layout). The session creates
+// non-owning ggml views into these tensors at the dflash-expected
+// `[head_dim, max_ctx, n_kv_heads]` layout — strides are non-standard
+// (`nb2 < nb1`) but every kernel we touch handles them via byte-offset
+// math (FA-vec, FA-MMA, cpy_q_q, set_rows).
+//
+// `slot_index` selects which `n_stream` slice of the external tensor the
+// session writes into (0..n_stream-1). The host is responsible for
+// ensuring the standard path and the dflash session do not race on the
+// same stream slice — typical use is one llama_kv_cache shared across
+// slots, with `slot_index = slot.id` per session.
+//
+// The caller retains ownership of the external tensors; the session
+// holds non-owning references and must be destroyed before the
+// llama_kv_cache that produced the tensors.
+//
+// Returns NULL on error.
+dflash_session_t * dflash_session_create_shared_borrow_kv(dflash_weights_t * weights,
+                                                            const dflash_session_params_t * params,
+                                                            ggml_backend_t backend,
+                                                            ggml_tensor * const * external_K,
+                                                            ggml_tensor * const * external_V,
+                                                            int n_full_attn_layers,
+                                                            int slot_index);
 
 void dflash_session_destroy(dflash_session_t * s);
 

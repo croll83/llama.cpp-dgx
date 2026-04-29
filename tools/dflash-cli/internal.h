@@ -238,9 +238,20 @@ struct TargetCache {
     int cur_pos  = 0;         // number of tokens already committed
 
     // Full-attention KV cache: one K and one V per full-attention layer.
-    // Layout: [head_dim, max_ctx, n_head_kv] f16, contiguous per layer.
+    // Layout: [head_dim, max_ctx, n_head_kv] in the cache's native quant
+    // type, contiguous per layer when self-allocated. When `kv_borrowed`
+    // is true the entries are non-owning views into an external buffer
+    // (typically llama_kv_cache.layers[il].k/v) — same logical shape,
+    // possibly non-standard ggml strides (`nb2 < nb1`) when the source
+    // packs heads onto axis 0. All cpy_q_q / fattn-vec / set_rows kernels
+    // we touch handle these strides via byte-offset math (validated
+    // 2026-04-29 — see docs/rfc-unified-target-cache.md Phase 1).
     std::vector<ggml_tensor *> attn_k;   // size = n_full_attn_layers (16)
     std::vector<ggml_tensor *> attn_v;
+    // True when attn_k/attn_v are non-owning views into an external buffer
+    // (e.g. the llama_kv_cache shared with the standard mmproj/vision path).
+    // Toggles the buffer-free / context-free path at session destruction.
+    bool                        kv_borrowed = false;
 
     // Persistent K_combined / V_combined tensors for the attention-sink path.
     // Each is shape [HEAD_DIM, fa_sink_padded + MAX_FA_WINDOW_PLUS_TOKENS, N_HEAD_KV]
@@ -333,12 +344,28 @@ void restore_anchor_state(TargetCache & c, int slot);
 // sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
 // mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
 // Pass 0 to use the default.
+// When `external_K` and `external_V` are non-null, both must point to
+// arrays of `n_external_layers` tensors (== n_full_attn_layers, 16 for
+// Qwen3.6) hosted in an external buffer (typically the slot's
+// llama_kv_cache layers). Each entry is expected to have the
+// llama_kv_cache layout `[head_dim*n_kv_heads, max_ctx, n_stream]` —
+// the cache-side `attn_k`/`attn_v` are then created as non-owning views
+// at the dflash logical shape `[head_dim, max_ctx, n_kv_heads]`,
+// pointing into `external_*`. `slot_index` selects the n_stream slice
+// (0..n_stream-1).
+//
+// When external_* are null (default), legacy path: allocate the K/V
+// tensors in a private buffer.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
                          TargetCache & out,
-                         int fa_sink_padded = 0);
+                         int fa_sink_padded = 0,
+                         ggml_tensor * const * external_K = nullptr,
+                         ggml_tensor * const * external_V = nullptr,
+                         int n_external_layers = 0,
+                         int slot_index = 0);
 
 void free_target_cache(TargetCache & c);
 

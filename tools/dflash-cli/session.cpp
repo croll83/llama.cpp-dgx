@@ -1030,6 +1030,58 @@ extern "C" dflash_session_t * dflash_session_create_shared(dflash_weights_t * we
     return s;
 }
 
+extern "C" dflash_session_t * dflash_session_create_shared_borrow_kv(
+        dflash_weights_t * weights,
+        const dflash_session_params_t * params_in,
+        ggml_backend_t backend,
+        ggml_tensor * const * external_K,
+        ggml_tensor * const * external_V,
+        int n_full_attn_layers,
+        int slot_index) {
+    if (!weights || !external_K || !external_V) return nullptr;
+
+    auto * s = new dflash_session_s();
+    s->backend      = backend;
+    s->weights      = weights;
+    s->owns_weights = false;
+    s->params       = params_in ? *params_in : dflash_session_default_params();
+
+    if (s->params.kv_tbq) g_kq_stride_pad = 256;
+    // Borrow path: K/V types come from the external tensors, so we cannot
+    // peek at env vars to decide stride pad. Inspect the supplied tensor
+    // type directly.
+    if (n_full_attn_layers > 0 && external_K[0] != nullptr) {
+        const ggml_type t = external_K[0]->type;
+        if (t == GGML_TYPE_TQ3_0 ||
+            t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 ||
+            t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO3_TCQ ||
+            t == GGML_TYPE_TURBO2_TCQ ||
+            t == GGML_TYPE_Q4_0) {
+            g_kq_stride_pad = 256;
+        }
+    }
+
+    s->max_ctx           = s->params.max_ctx > 0 ? s->params.max_ctx : 4096;
+    s->max_verify_tokens = s->params.ddtree
+        ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, s->params.ddtree_budget + 1)
+        : DFLASH27B_DRAFT_BLOCK_SIZE;
+
+    const int sink_pad = (s->params.fa_sink > 0)
+                                ? ((s->params.fa_sink + 255) / 256) * 256 : 0;
+    if (!create_target_cache(weights->w, s->max_ctx, s->max_verify_tokens,
+                             backend, s->cache, sink_pad,
+                             external_K, external_V,
+                             n_full_attn_layers, slot_index)) {
+        delete s;
+        return nullptr;
+    }
+
+    s->kv_end     = 0;
+    s->last_tok   = -1;
+    s->first_iter = true;
+    return s;
+}
+
 extern "C" dflash_session_t * dflash_session_create(const char * target_gguf,
                                                      const char * draft_safetensors,
                                                      const dflash_session_params_t * params_in,

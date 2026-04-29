@@ -73,7 +73,11 @@ bool create_target_cache(const TargetWeights & w,
                          int max_verify_tokens,
                          ggml_backend_t backend,
                          TargetCache & out,
-                         int fa_sink_padded) {
+                         int fa_sink_padded,
+                         ggml_tensor * const * external_K,
+                         ggml_tensor * const * external_V,
+                         int n_external_layers,
+                         int slot_index) {
     out.backend = backend;
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
@@ -84,6 +88,20 @@ bool create_target_cache(const TargetWeights & w,
 
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
+
+    // Validate external K/V borrow: both non-null, both same length, length matches.
+    const bool borrow_kv = (external_K != nullptr && external_V != nullptr);
+    if (borrow_kv) {
+        if (n_external_layers != n_full_attn) {
+            set_last_error("create_target_cache: borrow K/V layer count mismatch");
+            return false;
+        }
+        if (slot_index < 0) {
+            set_last_error("create_target_cache: slot_index must be >= 0");
+            return false;
+        }
+    }
+    out.kv_borrowed = borrow_kv;
 
     out.attn_k.assign(n_full_attn, nullptr);
     out.attn_v.assign(n_full_attn, nullptr);
@@ -151,16 +169,69 @@ bool create_target_cache(const TargetWeights & w,
     for (int il = 0; il < w.n_layer; il++) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         if (is_attn) {
-            // [head_dim, max_ctx, n_head_kv]
-            ggml_tensor * K = ggml_new_tensor_3d(out.ctx, kv_k_type,
-                                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
-            ggml_tensor * V = ggml_new_tensor_3d(out.ctx, kv_v_type,
-                                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+            ggml_tensor * K = nullptr;
+            ggml_tensor * V = nullptr;
             char name[64];
-            std::snprintf(name, sizeof(name), "cache_k_%d", il);
-            ggml_set_name(K, name);
-            std::snprintf(name, sizeof(name), "cache_v_%d", il);
-            ggml_set_name(V, name);
+            if (borrow_kv) {
+                // Borrow path: build non-owning views into the external
+                // llama_kv_cache layer K/V tensors. Source layout is
+                // `[head_dim*n_kv_heads, max_ctx, n_stream]`. We view it as
+                // dflash's `[head_dim, max_ctx, n_kv_heads]` — strides become
+                // non-standard (`nb2 < nb1`) but every kernel we touch
+                // handles them via byte-offset math. See RFC Phase 1.
+                ggml_tensor * src_K = external_K[fa_idx];
+                ggml_tensor * src_V = external_V[fa_idx];
+                if (!src_K || !src_V) {
+                    set_last_error("create_target_cache: borrow K/V is null at layer index");
+                    return false;
+                }
+                if ((int) src_K->ne[1] < max_ctx) {
+                    set_last_error("create_target_cache: borrow K source has ne[1] < max_ctx");
+                    return false;
+                }
+                // Type override: when borrowing, the external tensor's type
+                // wins — env vars DFLASH27B_KV_K/V are ignored on this path
+                // because the caller already owns the type via -ctk/-ctv.
+                kv_k_type = src_K->type;
+                kv_v_type = src_V->type;
+                const size_t qk_K = (size_t) ggml_blck_size(kv_k_type);
+                const size_t ts_K = (size_t) ggml_type_size(kv_k_type);
+                const size_t qk_V = (size_t) ggml_blck_size(kv_v_type);
+                const size_t ts_V = (size_t) ggml_type_size(kv_v_type);
+                if (q35::HEAD_DIM % qk_K || q35::HEAD_DIM % qk_V) {
+                    set_last_error("create_target_cache: HEAD_DIM not divisible by quant block size");
+                    return false;
+                }
+                const size_t off_K = (size_t) slot_index * src_K->nb[2];
+                const size_t off_V = (size_t) slot_index * src_V->nb[2];
+                K = ggml_view_3d(out.ctx, src_K,
+                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV,
+                                 src_K->nb[1],                      // c-axis stride (full row)
+                                 (q35::HEAD_DIM / qk_K) * ts_K,     // h-axis stride (head_dim worth)
+                                 off_K);
+                V = ggml_view_3d(out.ctx, src_V,
+                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV,
+                                 src_V->nb[1],
+                                 (q35::HEAD_DIM / qk_V) * ts_V,
+                                 off_V);
+                std::snprintf(name, sizeof(name), "borrow_cache_k_%d", il);
+                ggml_set_name(K, name);
+                std::snprintf(name, sizeof(name), "borrow_cache_v_%d", il);
+                ggml_set_name(V, name);
+            } else {
+                // Legacy path: allocate fresh K/V tensors in the cache's
+                // own ggml context (will be backed by `out.buf` after the
+                // ggml_backend_alloc_ctx_tensors call below).
+                // [head_dim, max_ctx, n_head_kv]
+                K = ggml_new_tensor_3d(out.ctx, kv_k_type,
+                                       q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+                V = ggml_new_tensor_3d(out.ctx, kv_v_type,
+                                       q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+                std::snprintf(name, sizeof(name), "cache_k_%d", il);
+                ggml_set_name(K, name);
+                std::snprintf(name, sizeof(name), "cache_v_%d", il);
+                ggml_set_name(V, name);
+            }
             out.attn_k[fa_idx] = K;
             out.attn_v[fa_idx] = V;
 
@@ -270,10 +341,14 @@ bool create_target_cache(const TargetWeights & w,
 
     // Zero-initialize all state tensors. We'll need a scratch zero buffer
     // since ggml_backend_tensor_memset isn't always available.
-    // Use a big-enough zero buffer and iterate.
+    // Use a big-enough zero buffer and iterate. Skip non-owning views —
+    // those reference external buffers (e.g. the borrowed llama_kv_cache
+    // K/V) where the host is responsible for initialisation. Zeroing
+    // them here would clobber data the caller expects to keep.
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(out.ctx); t != nullptr;
          t = ggml_get_next_tensor(out.ctx, t)) {
+        if (t->view_src != nullptr) continue;
         size_t nb = ggml_nbytes(t);
         size_t off = 0;
         while (off < nb) {
