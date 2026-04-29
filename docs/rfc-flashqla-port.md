@@ -1,9 +1,13 @@
 # RFC: Port FlashQLA chunked GDN forward to llama.cpp-dgx
 
-**Status**: Phase 0 reconnaissance done 2026-04-30. Implementation pending — multi-day work.  
-**Scope**: ggml/src/ggml-cuda/gated_delta_net.cu (new chunk-fused path) + dispatcher logic in tools/dflash-cli/qwen35_target_graph.cpp  
-**Estimate**: 3-5 days for a correctness-validated port; another 1-2 days for performance tuning on GB10.  
-**Savings target**: 2-3× forward speedup on GDN layers (= 48 of 64 layers in Qwen3.6) → estimated +30-50 % on prefill speed for long-context agent workloads. The GDN forward is the dominant cost on dflash prefill at ≥20K context (currently ~50 s for 22K tokens; should drop to ~25-30 s with FlashQLA).
+**Status**: Phase 0 + Phase 1 done 2026-04-30. FlashQLA does NOT fit on GB10
+hardware as-shipped — kernel tiles assume Hopper sm_90's 228 KB shared
+memory per block; GB10 sm_121a tops out at 99 KB. As-is port impossible.
+
+**Scope (revised)**: from-scratch chunk-fused kernel in ggml-cuda following
+FlashQLA's algorithmic insights but with GB10-appropriate tiles.
+**Estimate (revised)**: ~5-10 days of CUDA kernel work, not a port.
+**Savings (revised)**: TBD. Will only know after a GB10-targeted chunk kernel exists. The original 2-3× claim is Hopper-specific, not transferable.
 
 ## Context
 
@@ -50,12 +54,64 @@ Hardware constraints discovered:
   `use_qk_l2norm_in_kernel` from the apply call (the kwarg is already
   applied via `q = l2norm(q); k = l2norm(k)` earlier in the wrapper).
 
-## Phase 1: end-to-end correctness benchmark on FlashQLA (1 day)
+## Phase 1 RESULT (done 2026-04-30): SHOWSTOPPER
 
-Goal: confirm FlashQLA produces numerically-equivalent output to our
-`gated_delta_net.cu` on a single-chunk and multi-chunk input.
+FlashQLA's `prepare_h` kernel allocates ~192 KB of dynamic shared memory
+per block. GB10 sm_121a hardware reports:
 
-- Wait out the compile, time the cold + warm calls.
+- `cudaDevAttrMaxSharedMemoryPerBlockOptin` = **101376 bytes (99 KB)**
+- `cudaDevAttrMaxSharedMemoryPerMultiprocessor` = 102400 bytes (100 KB)
+
+Runtime fails immediately with:
+```
+tvm.error.InternalError: Failed to set the allowed dynamic shared memory size to 196608
+```
+
+Compute breakdown (`prepare_h.py` line 103+, with default
+num_stages=2, block_S=64, DK=128, DV=128, bf16):
+
+| buffer | size |
+|---|---|
+| k_shared (2-stage) | 32 KB |
+| v_shared (2-stage) | 32 KB |
+| a_shared (2-stage) | 16 KB |
+| g/b_shared (2-stage, fp32) | 1 KB |
+| h_shared | 32 KB |
+| x_shared | 16 KB |
+| y_shared | 16 KB |
+| m_shared_L/R | 32 KB |
+| **subtotal** | **~177 KB** |
+| + alignment padding etc | → **~192 KB observed** |
+
+The kernel was sized for Hopper sm_90 which has 228 KB per-block opt-in.
+Same kernel won't fit on:
+- sm_120 (RTX 5090 / B200 consumer): 99 KB
+- sm_121a (GB10 / Spark): 99 KB
+- Pre-Hopper (sm_80, sm_86, sm_89): 100-163 KB
+
+Only sm_90 (Hopper H100 / H200) and sm_100 (B100/B200 datacenter) have
+the headroom. AEON-7's RTX5090 / RTX-PRO-6000 numbers in their README
+are with the MTP head, NOT FlashQLA (which they only validate on H100/B100).
+
+**Workarounds and their cost:**
+
+1. **`num_stages = 1`**: halves k/v/a/g/b shared. Saves ~80 KB → fits
+   to ~112 KB → still over budget. Also kills the double-buffered
+   pipeline that gives the 2-3× speedup.
+2. **`block_DV = 64`**: halves V tile. Saves ~32 KB → ~160 KB still
+   over. And halves throughput on DV axis.
+3. **Both 1 + 2**: ~80 KB → fits! But probably ~1× vs our current
+   per-token kernel — speedup vanishes.
+4. **`chunk_size = 32`**: halves block_S. Saves ~24 KB → ~168 KB still
+   over.
+
+No combination retains the speedup AND fits in 99 KB. The kernel
+algorithm fundamentally requires Hopper's 228 KB headroom.
+
+## Phase 1.5 (cancelled)
+
+Cross-check with `tests/ref_gdr.py` skipped — kernel can't run.
+
 - Cross-check with `tests/ref_gdr.py` from the FlashQLA repo.
 - Measure speedup on a representative workload (T=4096, H=4, Hg=4,
   DK=128, DV=128 — matches Qwen3.6 GDN).
@@ -63,20 +119,17 @@ Goal: confirm FlashQLA produces numerically-equivalent output to our
 Decision point: if speedup is real (≥1.5×), proceed to phase 2. If
 not, abandon — the GDN compute time isn't actually the bottleneck.
 
-## Phase 2: extract CUDA from TileLang JIT (2 days)
+## Phase 2 (DEFERRED): extract CUDA from TileLang JIT
 
-TileLang is a TVM-derived DSL that lowers high-level tile descriptions
-to CUDA source. The actual `.cu` it generates is the artifact we need
-for llama.cpp.
+Skipped — Phase 1 showed the kernel can't run on GB10 anyway. Even if we
+extracted the CUDA, it would be sized for 192 KB shared and would fail
+to launch.
 
-- Find the JIT cache directory (typically `~/.cache/tilelang/` or
-  `/tmp/tilelang/`).
+If we ever want to revisit:
+- Find the JIT cache directory (typically `~/.cache/tilelang/` or `/tmp/tilelang/`).
 - Extract the generated `.cu` for `tilelang_fused_chunk_gdr_fwd_kernel`.
 - Inspect the WGMMA / WMMA instruction selection — should be sm_120a/sm_121a
   variants on Blackwell (different from Hopper's WGMMA).
-- Identify dependencies on TileLang runtime (cp.async helpers, etc) —
-  these need lightweight equivalents in our CUDA codebase or
-  inlining.
 
 ## Phase 3: integrate into ggml-cuda (2-3 days)
 
@@ -123,9 +176,39 @@ single-token decode. Prefill is monotonic, no rollback.
    GPUs) and sm_90 (Hopper). Not a concern for our specific GB10 box,
    but worth noting before upstreaming.
 
-## Status today (2026-04-30)
+## Status today (2026-04-30 final)
 
-Phase 0 done. TileLang installed at `/tmp/flashqla-venv`, FlashQLA
-patched at `/home/jarvis/flashqla-recon/FlashQLA/`. Phase 1 (e2e
-correctness benchmark) is the next concrete step. No code merged into
-the fork yet.
+Phase 0 + Phase 1 done. **As-is port to GB10 impossible** —
+192 KB shared > 99 KB GB10 limit. Original 2-3× speedup claim from the
+FlashQLA blog is Hopper-specific.
+
+Phases 2-5 of this RFC are abandoned for the as-is port. New
+alternative:
+
+## Alternative path: GB10-targeted from-scratch chunk kernel
+
+Take the algorithmic insights from FlashQLA — chunked GDN forward
+with parallelism-friendly math, gate-driven CP, warp-specialised
+pipeline — and write a NEW CUDA kernel sized for 99 KB shared budget.
+
+Tile shape budget for 99 KB:
+- num_stages = 1
+- block_S (chunk) = 64
+- DK = 128, DV = 64 (split DV across blocks, output combined)
+- → ~80 KB shared per block, fits with ~20 KB scratch headroom
+- Estimated speedup: 1.3-1.7× over our current per-token kernel
+  (still meaningful for prefill-dominant agent workloads)
+
+Estimate: 5-10 days of CUDA kernel work. Numerical validation against
+existing per-token kernel as ground truth.
+
+This is fundamentally a kernel engineering project, not a port.
+
+## Reconnaissance artifacts kept
+
+- `/home/jarvis/flashqla-recon/FlashQLA/` — patched FlashQLA repo
+  (SM gates relaxed, apply()/forward() arg-count fix)
+- `/tmp/flashqla-venv/` — virtualenv with tilelang 0.1.8 + torch 2.11
+- `/tmp/flashqla_phase1.py` — correctness test script (cancelled at
+  shared-mem failure)
+- `/tmp/flashqla_phase1.log` — full run log incl. shared-mem error
