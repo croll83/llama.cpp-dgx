@@ -61,7 +61,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 | `--dflash-max-ctx N` | `llama-server` | Per-slot dflash KV ring size. Default `--ctx-size / n_parallel`. |
 | `--dflash-prefill-ubatch N` | `llama-server` | dflash prefill ubatch size. Default 192 on GB10. |
 | `--dflash-fa-window N` | `llama-server` | **Sliding window FA on full-attn layers (port of [Luce-Org/lucebox-hub#26](https://github.com/Luce-Org/lucebox-hub/pull/26)).** Default 0 (off). When set (recommended 2048), limits FA to the last N KV positions per query: cuts FA cost from O(kv_len) to O(N) at long contexts, +26 % overall throughput on hermes agent traffic in our bench. **WARNING — agent-incompatible:** the window drops attention to early KV positions, including the system prompt. On agents whose identity / tool list is in the system prompt (Dark Jarvis SOUL, etc.), the model loses context once kv_start > window and falls back to vanilla refusals. Safe for raw continuation / story-style workloads; for agents wait for an attention-sink follow-up that pins the first K tokens + last W tokens. Production default is 0. |
-| `DFLASH27B_KV_V=tq3_0` | env | dflash V-cache type override (`q8_0` default). **Saves ~25% on the V side but agent-incompatible: hits a long-generation token-loop pathology on agent / coding workloads at ≥15K accumulated context** — commit/step ratio runs away to 14+ on a single repeated token id, then the slot stalls (we observed a 21-min hang on a code-review request that drove the slot to ~8K consecutive `0`s + Chinese garbage). Same pathology as `DFLASH27B_KV_K=tq3_0` below; the V-side compounds attention-score noise across thousands of DDtree verify reads. Standard llama path `-ctv tq3_0` is unaffected. Production default is `q8_0`. |
+| `DFLASH27B_KV_V=tq3_0` | env | dflash V-cache type override (`q8_0` default). **Body-dependent.** On Qwopus3.6 (NVFP4 quantises `linear_attn.conv1d` like everything else) it triggers a long-generation token-loop pathology at ≥15K accumulated context — commit/step ratio runs away to 14+ on a single repeated token id, then the slot stalls (we observed a 21-min hang on a code-review request that drove the slot to ~8K consecutive `0`s + Chinese garbage). **Safe on AEON-7 `Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS` and any body that preserves `linear_attn.conv1d` at BF16** — validated 2026-04-29 with full agent traffic (review-repo task, 37 iterations, up to 45K accumulated context, no drift, all tool_calls clean). The conv1d kernel is the recurrence-critical SSM 1D convolution; FP4-quantising it is what produced the cumulative attention-score noise we saw on Qwopus. Saves ~5 GiB at 131K × 2 slots. Standard llama path `-ctv tq3_0` is unaffected on either body. |
 | `DFLASH27B_KV_K=tq3_0` | env | **Experimental — do NOT use in production.** Boots and runs short prompts cleanly (commit `6858a4192` fixed the SIGSEGV by forcing the VEC fattn kernel) but hits a long-generation token-loop pathology on agent workloads (~78K committed tokens before it converges on a single repeated token id). Suspected cause: cumulative attention-score degradation from 3.5 bpw K compounded over thousands of decode steps in the dflash custom graph. Standard llama path `-ctk tq3_0` is unaffected and remains the recommended K-quant shortcut. |
 | `DFLASH27B_KV_TQ3=1` | env | Both dflash K and V to TQ3_0 in one shot. **Do NOT use in production** — combines both pathologies above. |
 | `DFLASH27B_KV_F16=1` | env | Force dflash KV back to f16 (regression baseline). |
@@ -91,7 +91,7 @@ This gives ~40 GiB resident on GPU (NVFP4 weights borrowed from llama_model + st
 - **Server dies silently right after `DFlash run:` log line, no `GGML_ASSERT` or CUDA error in the output.** Pre-`6858a4192` symptom of K=TQ3_0 selecting the MMA fattn kernel — which has no TQ3_0 dequant entry — and crashing on a NULL function pointer inside `launch_fattn<...>()`. Fixed by extending the force-VEC predicate in `ggml-cuda/fattn.cu` to include `GGML_TYPE_TQ3_0`. Re-pull and rebuild; if you still see this, get a backtrace with `gdb -batch -ex run llama-dflash <args>` to confirm.
 - **Agent stalls at "No response from provider for 180s", server log shows endless `[step N] committed=… last_tok=X next=X` with the same `X` for thousands of iterations.** Token-loop pathology on the dflash custom decode graph: the model produces a self-reinforcing prediction on a single token after enough accumulated context. Two known triggers, both fixed by switching the dflash KV cache off TQ3_0:
   - `DFLASH27B_KV_K=tq3_0` — onset around 78K committed tokens; symptom `last_tok=328 next=328` style.
-  - `DFLASH27B_KV_V=tq3_0` — onset earlier, around 15-25K accumulated context on coding / structured workloads. Symptom: commit/step ratio jumps to 14+, output is a wall of `0` tokens or Chinese filler. We observed a 21-min slot hang on a code-review request before the cancel propagation kicked in.
+  - `DFLASH27B_KV_V=tq3_0` on Qwopus3.6 — onset earlier, around 15-25K accumulated context on coding / structured workloads. Symptom: commit/step ratio jumps to 14+, output is a wall of `0` tokens or Chinese filler. We observed a 21-min slot hang on a code-review request before the cancel propagation kicked in. **Not present on AEON-7 `*-MTP-XS` body** (or any other body that preserves `linear_attn.conv1d` BF16) — the recurrence-critical SSM 1D convolution staying at BF16 is what eliminates the cumulative noise. If you swap target body, retest before assuming.
 
   Stop the server, drop both env overrides (or set them to `q8_0`), restart. Standard path `-ctk tq3_0 -ctv tq3_0` (without `--dflash`) is unaffected. Tracking in [`docs/dflash_kv_quant_status.md`](docs/dflash_kv_quant_status.md).
 - **`GGML_ASSERT(buf != NULL && "tensor buffer not set")` from `ggml_backend_tensor_set` during dflash prefill.** Pre-fix symptom on `DFLASH27B_KV_V=q8_0` (or any non-TQ3_0 V-type): `build_full_attn_block` only references the `kv_idxs` input on the `set_rows` path (TQ3_0-only), so on the cpy fallback path `ggml_gallocr` dead-code-eliminates the input and `sg.kv_idxs->buffer` stays NULL. Fixed in `tools/dflash-cli/session.cpp` by gating the upload on `sg.kv_idxs->buffer != nullptr`. If you see this on a build past that commit, your build tree is stale — `cmake --build build --target llama-server -j` and relaunch.
@@ -103,12 +103,28 @@ This gives ~40 GiB resident on GPU (NVFP4 weights borrowed from llama_model + st
 
 ## Memory savings stack
 
+Two production stable end-states depending on target body. Both use np=2, 131K
+context per slot, mmproj loaded, dflash + dflash drafter v4.
+
+**Qwopus3.6 (FP4 conv1d, drift-prone with TQ3 V):**
+
 | Stage | GPU resident | Δ |
 |---|---:|---:|
-| Baseline (np=2, mmproj, NVFP4, weights duplicated) | 58.4 GiB | — |
+| Baseline (weights duplicated) | 58.4 GiB | — |
 | + borrow llama_model weights (commit `87102e46b`) | 39.9 GiB | −18.5 GiB |
 | + standard `-ctk tq3_0 -ctv tq3_0` (commit `7b5f82569`) | 37.5 GiB | −2.4 GiB |
-| **stable end-state** | **37.5 GiB** | **−20.9 GiB / −36 %** |
+| **stable end-state, V cache stuck at Q8 to dodge drift** | **~64 GiB** at `-c 262144` | |
+
+**AEON-7 `Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS` (conv1d preserved BF16, drift-immune):**
+
+| Stage | GPU resident | Δ |
+|---|---:|---:|
+| Baseline (Qwopus state) | 64 GiB | — |
+| + AEON-7 XS body swap (`linear_attn.conv1d` BF16) | 64 GiB | 0 *(model size near-identical)* |
+| + halve `DFLASH_ANCHOR_SLOTS` 4 → 2 (commit `ba400dcee`) | 62 GiB | −2 GiB |
+| + `-c 262144 → -c 131072` (vision context cap) | 59 GiB | −3 GiB |
+| + `DFLASH27B_KV_V=tq3_0` (re-enabled, conv1d-BF16 fixes drift) | **~55 GiB** | −4 GiB |
+| **stable end-state, full-quality agent traffic up to 45K context** | **~55 GiB** | **−9 GiB vs Qwopus, −47 % vs vLLM equivalent (103 GiB)** |
 | (extra) dflash `DFLASH27B_KV_K=tq3_0` + force-VEC fix (commit `6858a4192`) | 34.9 GiB | −2.6 GiB but **unstable**: long-generation token loop |
 
 The last row is left in the codebase as a documented experimental knob — see the flags reference. `DFLASH27B_KV_K=tq3_0` boots, passes short-prompt sanity, but loses coherence on agent-style multi-turn / long-decode workloads (we saw the model degenerate to a single-token loop after ~78K committed tokens). Standard path `-ctk tq3_0` is unaffected.
