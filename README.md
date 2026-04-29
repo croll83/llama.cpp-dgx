@@ -61,9 +61,9 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 | `--dflash-max-ctx N` | `llama-server` | Per-slot dflash KV ring size. Default `--ctx-size / n_parallel`. |
 | `--dflash-prefill-ubatch N` | `llama-server` | dflash prefill ubatch size. Default 192 on GB10. |
 | `--dflash-fa-window N` | `llama-server` | **Sliding window FA on full-attn layers (port of [Luce-Org/lucebox-hub#26](https://github.com/Luce-Org/lucebox-hub/pull/26)).** Default 0 (off). When set (recommended 2048), limits FA to the last N KV positions per query: cuts FA cost from O(kv_len) to O(N) at long contexts, +26 % overall throughput on hermes agent traffic in our bench. **WARNING — agent-incompatible:** the window drops attention to early KV positions, including the system prompt. On agents whose identity / tool list is in the system prompt (Dark Jarvis SOUL, etc.), the model loses context once kv_start > window and falls back to vanilla refusals. Safe for raw continuation / story-style workloads; for agents wait for an attention-sink follow-up that pins the first K tokens + last W tokens. Production default is 0. |
-| `DFLASH27B_KV_V=tq3_0` | env | dflash V-cache type override (`q8_0` default; `tq3_0` saves ~25% on the V side). |
+| `DFLASH27B_KV_V=tq3_0` | env | dflash V-cache type override (`q8_0` default). **Saves ~25% on the V side but agent-incompatible: hits a long-generation token-loop pathology on agent / coding workloads at ≥15K accumulated context** — commit/step ratio runs away to 14+ on a single repeated token id, then the slot stalls (we observed a 21-min hang on a code-review request that drove the slot to ~8K consecutive `0`s + Chinese garbage). Same pathology as `DFLASH27B_KV_K=tq3_0` below; the V-side compounds attention-score noise across thousands of DDtree verify reads. Standard llama path `-ctv tq3_0` is unaffected. Production default is `q8_0`. |
 | `DFLASH27B_KV_K=tq3_0` | env | **Experimental — do NOT use in production.** Boots and runs short prompts cleanly (commit `6858a4192` fixed the SIGSEGV by forcing the VEC fattn kernel) but hits a long-generation token-loop pathology on agent workloads (~78K committed tokens before it converges on a single repeated token id). Suspected cause: cumulative attention-score degradation from 3.5 bpw K compounded over thousands of decode steps in the dflash custom graph. Standard llama path `-ctk tq3_0` is unaffected and remains the recommended K-quant shortcut. |
-| `DFLASH27B_KV_TQ3=1` | env | Both dflash K and V to TQ3_0 in one shot. |
+| `DFLASH27B_KV_TQ3=1` | env | Both dflash K and V to TQ3_0 in one shot. **Do NOT use in production** — combines both pathologies above. |
 | `DFLASH27B_KV_F16=1` | env | Force dflash KV back to f16 (regression baseline). |
 | `TURBO_LAYER_ADAPTIVE=N` | env | Layer-adaptive Turbo KV quant (1–11 strategies; 0 = uniform, default). |
 
@@ -72,24 +72,29 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 For 262K context with `-np 2` (two persistent slots, e.g. agent + memory writer) on the Qwopus3.6 27B target:
 
 ```bash
-DFLASH27B_KV_V=tq3_0 \
 ./build/bin/llama-server \
   -m /path/to/Qwopus-27B-NVFP4-plain.gguf \
   --mmproj /path/to/mmproj-Abliterated-F16.gguf \
-  --dflash --dflash-draft /path/to/qwopus36-dflash-v2/model.safetensors \
+  --dflash --dflash-draft /path/to/qwopus36-dflash-v4/model.safetensors \
   --dflash-budget 22 --dflash-max-ctx 131072 --dflash-prefill-ubatch 192 \
   --host 0.0.0.0 --port 30000 -c 262144 -np 2 -ngl 99 \
-  -ctk tq3_0 -ctv tq3_0 \
+  -ctk q8_0 -ctv q8_0 \
+  --dflash-fa-window 16384 --dflash-fa-sink 16384 \
   --slot-prompt-similarity 0.5 --cache-reuse 256 \
   --jinja --reasoning auto --alias dark-opus --no-webui --no-warmup
 ```
 
-This gives ~37.7 GiB resident on GPU (NVFP4 weights borrowed from llama_model + standard KV K=TQ3_0 V=TQ3_0 + dflash V=TQ3_0 ring, dflash K stays Q8_0, np=2). Down from 58.4 GiB on the same workload before the borrow / TQ3 patches landed (~36% saving). The dflash K=TQ3_0 path would shave another ~2.8 GiB but causes long-generation loops, so it is intentionally not enabled by default — see the flags reference for `DFLASH27B_KV_K=tq3_0`.
+This gives ~40 GiB resident on GPU (NVFP4 weights borrowed from llama_model + standard KV K=Q8_0 V=Q8_0 + dflash V=Q8_0 ring, dflash K stays Q8_0, np=2). The TQ3_0 KV path would save another ~6 GiB but is unsafe on agent / coding workloads — both `DFLASH27B_KV_V=tq3_0` and `DFLASH27B_KV_K=tq3_0` cause a long-generation token-loop pathology after ~15-30K accumulated context. The standard llama path `-ctk tq3_0 -ctv tq3_0` is unaffected and remains a valid VRAM-saver if you can run **without** `--dflash`. The `--dflash-fa-sink 16384 --dflash-fa-window 16384` pair caps FA cost at long context while preserving the system prompt (attention-sink port, see `docs/dflash_kv_quant_status.md`).
 
 ## Troubleshooting
 
 - **Server dies silently right after `DFlash run:` log line, no `GGML_ASSERT` or CUDA error in the output.** Pre-`6858a4192` symptom of K=TQ3_0 selecting the MMA fattn kernel — which has no TQ3_0 dequant entry — and crashing on a NULL function pointer inside `launch_fattn<...>()`. Fixed by extending the force-VEC predicate in `ggml-cuda/fattn.cu` to include `GGML_TYPE_TQ3_0`. Re-pull and rebuild; if you still see this, get a backtrace with `gdb -batch -ex run llama-dflash <args>` to confirm.
-- **Agent stalls at "No response from provider for 180s", server log shows endless `[step N] committed=… last_tok=X next=X` with the same `X` for thousands of iterations.** Token-loop pathology when `DFLASH27B_KV_K=tq3_0` is set: the dflash custom decode graph produces a self-reinforcing prediction on a single token after ~tens of thousands of committed tokens. Stop the server, `unset DFLASH27B_KV_K`, restart. Standard path `-ctk tq3_0` is fine to keep — only the env-driven dflash K override has this issue. Tracking in [`docs/dflash_kv_quant_status.md`](docs/dflash_kv_quant_status.md).
+- **Agent stalls at "No response from provider for 180s", server log shows endless `[step N] committed=… last_tok=X next=X` with the same `X` for thousands of iterations.** Token-loop pathology on the dflash custom decode graph: the model produces a self-reinforcing prediction on a single token after enough accumulated context. Two known triggers, both fixed by switching the dflash KV cache off TQ3_0:
+  - `DFLASH27B_KV_K=tq3_0` — onset around 78K committed tokens; symptom `last_tok=328 next=328` style.
+  - `DFLASH27B_KV_V=tq3_0` — onset earlier, around 15-25K accumulated context on coding / structured workloads. Symptom: commit/step ratio jumps to 14+, output is a wall of `0` tokens or Chinese filler. We observed a 21-min slot hang on a code-review request before the cancel propagation kicked in.
+
+  Stop the server, drop both env overrides (or set them to `q8_0`), restart. Standard path `-ctk tq3_0 -ctv tq3_0` (without `--dflash`) is unaffected. Tracking in [`docs/dflash_kv_quant_status.md`](docs/dflash_kv_quant_status.md).
+- **`GGML_ASSERT(buf != NULL && "tensor buffer not set")` from `ggml_backend_tensor_set` during dflash prefill.** Pre-fix symptom on `DFLASH27B_KV_V=q8_0` (or any non-TQ3_0 V-type): `build_full_attn_block` only references the `kv_idxs` input on the `set_rows` path (TQ3_0-only), so on the cpy fallback path `ggml_gallocr` dead-code-eliminates the input and `sg.kv_idxs->buffer` stays NULL. Fixed in `tools/dflash-cli/session.cpp` by gating the upload on `sg.kv_idxs->buffer != nullptr`. If you see this on a build past that commit, your build tree is stale — `cmake --build build --target llama-server -j` and relaunch.
 - **`speculative decoding not supported by this context` log line on init.** Expected with `--dflash`: this is the legacy speculative-decoding path's compat probe failing because the dflash session takes over. The DFlash session is unrelated.
 - **`cache_reuse is not supported by multimodal` log line.** Expected with `--mmproj` + `--cache-reuse`. The prompt cache stays effective for slot persistence; only the cross-request prefix-match path is disabled.
 - **`fattn vec kernel` aborts with K%256 != 0.** Either the cache type is one of the TQ3_0 / TURBO* family on the standard path (the fork bumps `fattn_stride` to 256 automatically — make sure you're on `origin/feature/dflash-integration` or later) or you set `--dflash-max-ctx` to a non-256-aligned value.
