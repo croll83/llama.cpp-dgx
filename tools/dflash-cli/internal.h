@@ -280,7 +280,11 @@ struct TargetCache {
     // early (mid-history) divergence points.
     //
     // Outer dim = DFLASH_ANCHOR_SLOTS. Inner = n_delta_layers (48).
-    static constexpr int DFLASH_ANCHOR_SLOTS = 4;
+    static constexpr int DFLASH_ANCHOR_SLOTS = 2;
+    // Reduced from 4 to 2: each anchor stores a full SSM+conv snapshot for all
+    // 48 GDN layers, which is ~3.5 GiB per slot per anchor in F32. Halving to 2
+    // saves ~7 GiB at np=2 with negligible quality cost on agent workloads —
+    // DDtree at budget=22 rarely triggers deep rollback past 2 anchor positions.
     std::vector<std::vector<ggml_tensor *>> ssm_state_anchors;    // [K][n_delta]
     std::vector<std::vector<ggml_tensor *>> conv_state_anchors;   // [K][n_delta]
     std::array<int, DFLASH_ANCHOR_SLOTS>    anchor_positions{};   // 0 = empty slot
