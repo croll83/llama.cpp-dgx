@@ -103,8 +103,11 @@ This gives ~40 GiB resident on GPU (NVFP4 weights borrowed from llama_model + st
 
 ## Memory savings stack
 
-Two production stable end-states depending on target body. Both use np=2, 131K
-context per slot, mmproj loaded, dflash + dflash drafter v4.
+Two production stable end-states depending on target body. Both use np=2, mmproj
+loaded, dflash + dflash drafter v4. **The dflash agent path uses
+`--dflash-max-ctx 131072` per slot independently of `-c`** — `-c` only sizes the
+standard `llama_kv_cache` that the mmproj/vision path uses. The two contexts are
+separate.
 
 **Qwopus3.6 (FP4 conv1d, drift-prone with TQ3 V):**
 
@@ -113,18 +116,25 @@ context per slot, mmproj loaded, dflash + dflash drafter v4.
 | Baseline (weights duplicated) | 58.4 GiB | — |
 | + borrow llama_model weights (commit `87102e46b`) | 39.9 GiB | −18.5 GiB |
 | + standard `-ctk tq3_0 -ctv tq3_0` (commit `7b5f82569`) | 37.5 GiB | −2.4 GiB |
-| **stable end-state, V cache stuck at Q8 to dodge drift** | **~64 GiB** at `-c 262144` | |
+| **stable end-state, V cache stuck at Q8 to dodge drift, `-c 262144`** | **~64-72 GiB** | |
 
 **AEON-7 `Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS` (conv1d preserved BF16, drift-immune):**
 
-| Stage | GPU resident | Δ |
-|---|---:|---:|
-| Baseline (Qwopus state) | 64 GiB | — |
-| + AEON-7 XS body swap (`linear_attn.conv1d` BF16) | 64 GiB | 0 *(model size near-identical)* |
-| + halve `DFLASH_ANCHOR_SLOTS` 4 → 2 (commit `ba400dcee`) | 62 GiB | −2 GiB |
-| + `-c 262144 → -c 131072` (vision context cap) | 59 GiB | −3 GiB |
-| + `DFLASH27B_KV_V=tq3_0` (re-enabled, conv1d-BF16 fixes drift) | **~55 GiB** | −4 GiB |
-| **stable end-state, full-quality agent traffic up to 45K context** | **~55 GiB** | **−9 GiB vs Qwopus, −47 % vs vLLM equivalent (103 GiB)** |
+| Stage | GPU resident | dflash agent ctx/slot | mmproj ctx/slot | Δ |
+|---|---:|---:|---:|---:|
+| Baseline (Qwopus state) | 64 GiB | 131K | 131K | — |
+| + AEON-7 XS body swap (`linear_attn.conv1d` BF16) | 64 GiB | 131K | 131K | 0 |
+| + halve `DFLASH_ANCHOR_SLOTS` 4 → 2 (commit `ba400dcee`) | 62 GiB | 131K | 131K | −2 GiB |
+| + `DFLASH27B_KV_V=tq3_0` (re-enabled, conv1d-BF16 fixes drift) | ~58 GiB | 131K | 131K | −4 GiB |
+| **AEON full vision context, `-c 262144 -np 2`** | **~58 GiB** | **131K** | **131K** | **−6 GiB vs Qwopus baseline** |
+| (extra) `-c 131072 -np 2` — half-vision context | 55 GiB | 131K | **65K** | additional −3 GiB |
+| **AEON tight, `-c 131072 -np 2`** | **~55 GiB** | **131K** | **65K** | **−9 GiB vs Qwopus** |
+
+The "tight" row trades half the vision context for ~3 GiB extra resident savings.
+The agent path is unaffected — dflash sizes its own KV ring via `--dflash-max-ctx`.
+For pure-text agent traffic the tight row is the better choice; for image-heavy
+multimodal workflows where you want full 131K vision capacity, prefer the
+"full vision context" row.
 | (extra) dflash `DFLASH27B_KV_K=tq3_0` + force-VEC fix (commit `6858a4192`) | 34.9 GiB | −2.6 GiB but **unstable**: long-generation token loop |
 
 The last row is left in the codebase as a documented experimental knob — see the flags reference. `DFLASH27B_KV_K=tq3_0` boots, passes short-prompt sanity, but loses coherence on agent-style multi-turn / long-decode workloads (we saw the model degenerate to a single-token loop after ~78K committed tokens). Standard path `-ctk tq3_0` is unaffected.
