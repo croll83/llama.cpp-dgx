@@ -644,6 +644,16 @@ class ModelBase:
         for name in list(self.model_tensors.keys()):
             if not name.endswith(".weight"):
                 continue
+            # MmprojModel: only process tensors belonging to the vision tower; the same
+            # safetensors may carry NVFP4-quantized text-body weights (Qwen3.5VL etc.)
+            # that the mmproj tensor map cannot resolve.
+            if isinstance(self, MmprojModel) and not (
+                name.startswith("model.visual")
+                or name.startswith("visual.")
+                or "vision_tower" in name
+                or "vision_model" in name
+            ):
+                continue
             scale_name = name.replace(".weight", ".weight_scale")
             scale2_name = name.replace(".weight", ".weight_scale_2")
             input_scale_name = name.replace(".weight", ".input_scale")
