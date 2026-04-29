@@ -1422,6 +1422,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+ggml_tensor * llama_kv_cache::get_layer_k_tensor(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return nullptr;
+    return layers[it->second].k;
+}
+
+ggml_tensor * llama_kv_cache::get_layer_v_tensor(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return nullptr;
+    return layers[it->second].v;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 

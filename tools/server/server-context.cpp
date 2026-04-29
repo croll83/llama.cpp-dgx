@@ -930,15 +930,62 @@ private:
                 dp.prefill_ubatch    = params_base.dflash_prefill_ubatch;
                 dp.fa_window         = params_base.dflash_fa_window;
                 dp.fa_sink           = params_base.dflash_fa_sink;
-                slot.dflash_session = dflash_session_create_shared(
-                    dflash_weights, &dp, dflash_backend);
-                if (!slot.dflash_session) {
-                    SRV_ERR("DFlash: session_create_shared failed for slot %d: %s\n",
-                            i, dflash27b_last_error());
-                    return false;
+
+                // Optional: share the standard llama_kv_cache K/V buffers with
+                // the dflash session via the borrow API. Saves the duplicate
+                // ~9 GiB of K+V at 131K × 2 slots that the two paths otherwise
+                // each carry. Gated by env DFLASH27B_SHARE_KV (default off
+                // until we have production validation; set to 1 to enable).
+                bool share_kv = false;
+                if (const char * env = std::getenv("DFLASH27B_SHARE_KV")) {
+                    share_kv = (std::atoi(env) != 0);
                 }
-                SLT_INF(slot, "DFlash session ready (budget=%d, max_ctx=%d, fa_window=%d, fa_sink=%d)\n",
-                        dp.ddtree_budget, dp.max_ctx, dp.fa_window, dp.fa_sink);
+                if (share_kv) {
+                    // Build arrays of per-layer K/V tensors for the 16 full-attn
+                    // layers. For Qwen3.6 (full_attention_interval=4) the attn
+                    // layers are at indices il where (il+1) % 4 == 0
+                    // → 3, 7, 11, ..., 63.
+                    const llama_model * lm = llama_get_model(ctx);
+                    llama_memory_t mem = llama_get_memory(ctx);
+                    const int n_layer  = llama_model_n_layer(lm);
+                    std::vector<ggml_tensor *> ext_K, ext_V;
+                    ext_K.reserve(16);
+                    ext_V.reserve(16);
+                    for (int il = 0; il < n_layer; il++) {
+                        ggml_tensor * k_il = llama_kv_cache_get_layer_k(mem, il);
+                        if (!k_il) continue;          // delta-net layer or non-attn
+                        ggml_tensor * v_il = llama_kv_cache_get_layer_v(mem, il);
+                        if (!v_il) continue;
+                        ext_K.push_back(k_il);
+                        ext_V.push_back(v_il);
+                    }
+                    if ((int) ext_K.size() != 16) {
+                        SRV_ERR("DFlash: share-kv expected 16 attn layers from llama_kv_cache, got %d\n",
+                                (int) ext_K.size());
+                        return false;
+                    }
+                    slot.dflash_session = dflash_session_create_shared_borrow_kv(
+                        dflash_weights, &dp, dflash_backend,
+                        ext_K.data(), ext_V.data(), (int) ext_K.size(),
+                        /*slot_index=*/i);
+                    if (!slot.dflash_session) {
+                        SRV_ERR("DFlash: session_create_shared_borrow_kv failed for slot %d: %s\n",
+                                i, dflash27b_last_error());
+                        return false;
+                    }
+                    SLT_INF(slot, "DFlash session ready (borrow_kv=on, budget=%d, max_ctx=%d, fa_window=%d, fa_sink=%d)\n",
+                            dp.ddtree_budget, dp.max_ctx, dp.fa_window, dp.fa_sink);
+                } else {
+                    slot.dflash_session = dflash_session_create_shared(
+                        dflash_weights, &dp, dflash_backend);
+                    if (!slot.dflash_session) {
+                        SRV_ERR("DFlash: session_create_shared failed for slot %d: %s\n",
+                                i, dflash27b_last_error());
+                        return false;
+                    }
+                    SLT_INF(slot, "DFlash session ready (budget=%d, max_ctx=%d, fa_window=%d, fa_sink=%d)\n",
+                            dp.ddtree_budget, dp.max_ctx, dp.fa_window, dp.fa_sink);
+                }
             }
 
             slots.push_back(std::move(slot));

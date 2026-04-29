@@ -8,6 +8,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -3227,6 +3229,30 @@ int32_t llama_set_adapter_cvec(
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
+}
+
+// Resolve the underlying llama_kv_cache from a possibly-hybrid memory.
+// Returns nullptr when the memory is recurrent-only or some other type
+// that doesn't carry a per-layer K/V tensor pair.
+static const llama_kv_cache * llama_resolve_kv_cache_(llama_memory_t mem) {
+    if (!mem) return nullptr;
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv;
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_attn();
+    }
+    return nullptr;
+}
+
+ggml_tensor * llama_kv_cache_get_layer_k(llama_memory_t mem, int32_t il) {
+    const llama_kv_cache * kv = llama_resolve_kv_cache_(mem);
+    return kv ? kv->get_layer_k_tensor(il) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_get_layer_v(llama_memory_t mem, int32_t il) {
+    const llama_kv_cache * kv = llama_resolve_kv_cache_(mem);
+    return kv ? kv->get_layer_v_tensor(il) : nullptr;
 }
 
 void llama_memory_clear(llama_memory_t mem, bool data) {

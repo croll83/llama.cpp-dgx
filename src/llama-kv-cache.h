@@ -165,6 +165,15 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // Accessor for the raw per-layer K / V backing tensors (no view, no
+    // ggml_context). Used by external decoders that want to share the cache
+    // buffers — e.g. the dflash custom graph borrowing the standard
+    // mmproj-path cache via dflash_session_create_shared_borrow_kv. Returns
+    // nullptr when the layer isn't in this cache (e.g. a delta-net layer
+    // mapped to a different sub-cache in a hybrid memory).
+    ggml_tensor * get_layer_k_tensor(int32_t il) const;
+    ggml_tensor * get_layer_v_tensor(int32_t il) const;
+
     // TurboQuant: get rotation matrices (stored as row-major C arrays)
     // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
     // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)

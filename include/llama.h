@@ -568,6 +568,15 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
+    // Accessors for the per-layer K / V backing tensors of an attention KV
+    // cache. Returns nullptr if the memory does not contain such a cache for
+    // the given layer (e.g. layer is recurrent / SSM-only, or memory is a
+    // recurrent-only kind). Used by external decoders that want to share the
+    // cache buffer with llama_decode (e.g. dflash custom graph borrowing the
+    // mmproj-path cache).
+    LLAMA_API struct ggml_tensor * llama_kv_cache_get_layer_k(llama_memory_t mem, int32_t il);
+    LLAMA_API struct ggml_tensor * llama_kv_cache_get_layer_v(llama_memory_t mem, int32_t il);
+
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
