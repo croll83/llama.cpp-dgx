@@ -65,6 +65,7 @@ These flags / env vars exist only in this fork (or have changed semantics vs ups
 | `DFLASH27B_KV_K=tq3_0` | env | **Experimental — do NOT use in production.** Boots and runs short prompts cleanly (commit `6858a4192` fixed the SIGSEGV by forcing the VEC fattn kernel) but hits a long-generation token-loop pathology on agent workloads (~78K committed tokens before it converges on a single repeated token id). Suspected cause: cumulative attention-score degradation from 3.5 bpw K compounded over thousands of decode steps in the dflash custom graph. Standard llama path `-ctk tq3_0` is unaffected and remains the recommended K-quant shortcut. |
 | `DFLASH27B_KV_TQ3=1` | env | Both dflash K and V to TQ3_0 in one shot. **Do NOT use in production** — combines both pathologies above. |
 | `DFLASH27B_KV_F16=1` | env | Force dflash KV back to f16 (regression baseline). |
+| `DFLASH27B_SHARE_KV=1` | env | **Share the standard `llama_kv_cache` K/V buffers with the dflash session** (target body only — not the drafter). The dflash custom graph builds non-owning ggml views into `llama_kv_cache.layers[il].k/v` instead of allocating its own per-layer K/V. Saves **~9 GiB resident** at np=2 with `--dflash-max-ctx 131072` and `-c 262144`, by removing the duplicate K/V the two paths otherwise each carry. The view layout uses non-standard ggml strides (`nb2 < nb1`, since llama_kv_cache packs heads onto axis 0); every kernel touched (FA-vec direct vec_dot, FA-MMA-F16 via to_fp16_nc dequant, cpy_q_q, set_rows<block_q8_0>) handles arbitrary strides via byte-offset math (no kernel patches needed — see `docs/rfc-unified-target-cache.md`). The K/V types come from `-ctk`/`-ctv` on this path; `DFLASH27B_KV_K`/`_V` are ignored. **Default 0 (off)** until production validation completes. Caveat: when both share-kv and `--mmproj` are on and the slot processes a vision request followed by a text request, the dflash session detects the kv_end desync and forces a full re-prefill (correct, but costs one prefill round) — the standard path's writes are preserved bit-for-bit since both paths produce the same K/V projections from the same target weights. |
 | `TURBO_LAYER_ADAPTIVE=N` | env | Layer-adaptive Turbo KV quant (1–11 strategies; 0 = uniform, default). |
 
 ## Recommended runtime config (GB10, 128 GB unified memory)
@@ -125,8 +126,10 @@ separate.
 | Baseline (Qwopus state) | 64 GiB | 131K | 131K | — |
 | + AEON-7 XS body swap (`linear_attn.conv1d` BF16) | 64 GiB | 131K | 131K | 0 |
 | + halve `DFLASH_ANCHOR_SLOTS` 4 → 2 (commit `ba400dcee`) | 62 GiB | 131K | 131K | −2 GiB |
-| + `-c 262144 → -c 131072` (vision context cap to 65K/slot) | **~59 GiB** | **131K** | **65K** | **−3 GiB** |
-| **stable end-state with V=Q8 on dflash** | **~59 GiB** | **131K** | **65K** | **−5 GiB vs Qwopus baseline** |
+| + `DFLASH_ANCHOR_SLOTS = 1` | 61 GiB | 131K | 131K | −1 GiB |
+| + mmproj F16 → Q8 (`mmproj-AEON-XS-Q8.gguf`, 928 MB → 629 MB) | 60.7 GiB | 131K | 131K | −0.3 GiB |
+| **+ `DFLASH27B_SHARE_KV=1`** (Phase 2.2 unified target K/V cache, RFC) | **~54 GiB** | **131K** | **131K** | **−6.5 GiB** |
+| **stable end-state with V=Q8 on dflash, full 131K vision** | **~54 GiB** | **131K** | **131K** | **−10 GiB vs Qwopus baseline, −47 GiB vs vLLM equivalent (103 GiB)** |
 
 We attempted a `DFLASH27B_KV_V=tq3_0` re-enable on AEON XS (would have saved
 ~4 GiB extra) but rolled it back: conv1d-BF16 preservation reduces the drift

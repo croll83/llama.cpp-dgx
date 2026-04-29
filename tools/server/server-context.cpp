@@ -3329,6 +3329,28 @@ private:
             }
         }
 
+        // Phase 4 defensive sync: when can_append is true the server's
+        // server_tokens/cached_toks bookkeeping says the slot's prefix is
+        // intact. But the dflash session keeps its OWN kv_end counter that
+        // does not advance when the standard llama_decode path runs on the
+        // slot (e.g. for a vision request when --mmproj is loaded and
+        // share-kv is on, both paths use the same physical K/V buffer but
+        // separate position counters). If dflash.kv_end != prefill_off we
+        // would otherwise prefill the delta at the wrong position and
+        // corrupt the cache. Force a full reset on mismatch — costs one
+        // re-prefill but keeps the cache consistent.
+        if (slot.dflash_session && append_mode) {
+            const int dflash_kv = dflash_session_kv_end(slot.dflash_session);
+            if (dflash_kv != prefill_off) {
+                SRV_INF("DFlash kv_end desync: slot=%d session.kv_end=%d server.prefill_off=%d — forcing reset\n",
+                        slot.id, dflash_kv, prefill_off);
+                dflash_session_reset(slot.dflash_session);
+                append_mode = 0;
+                prefill_off = 0;
+                can_append  = false;
+            }
+        }
+
         std::vector<int32_t> delta_ids;
         delta_ids.reserve(n_prompt - prefill_off);
         for (int i = prefill_off; i < n_prompt; i++) {

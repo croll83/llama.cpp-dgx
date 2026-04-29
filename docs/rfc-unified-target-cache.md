@@ -1,9 +1,14 @@
 # RFC: Unify target K/V cache between standard llama_kv_cache and dflash session
 
-**Status**: draft, author Claude with Marco, 2026-04-29  
-**Scope**: tools/dflash-cli + src/llama-kv-cache + tools/server  
-**Estimate**: 2-4 weeks (high uncertainty on FA-kernel stride compatibility)  
-**Savings target**: -7 GiB resident on np=2 + remove redundant prefill on text↔vision context switches
+**Status**: Phase 1 + 2 + 4-defensive + 5 LANDED 2026-04-29.
+Commits: `cab95737a` (anchor 4→2 + RFC), `67b9e0c54` (Phase 2.1 dflash
+borrow API), `03ea32aef` (Phase 2.2 wiring + public llama API). Followup
+commit adds Phase 4 defensive desync guard. Full Phase 4 (SSM state
+sharing) deferred indefinitely — out of scope for the savings we wanted.
+
+**Scope**: tools/dflash-cli + src/llama-kv-cache + src/llama-context + tools/server  
+**Estimate (revised)**: 1 day for Phase 1+2+3+4-defensive+5 (vs original 2-4 weeks). Mostly because Phase 1 kernel-stride validation by code inspection found NO patches needed.  
+**Savings achieved**: **−9 GiB resident** on np=2 (predicted ~9.1 GiB, measured 63 GiB → 54 GiB after enabling `DFLASH27B_SHARE_KV=1`).
 
 ## Problem
 
@@ -157,22 +162,51 @@ Kernels that read dflash K/V:
 - Make the borrow path opt-in via a flag `--dflash-share-kv` initially,
   default off. Enable by default once stable.
 
-### Phase 4: cross-path cache hit (2-3 days)
+### Phase 4: cross-path cache hit (deferred — see Status)
 
-- When the standard llama_decode path writes K/V to a position, the
-  dflash session sees that data on a subsequent text-only call to the
-  same slot.
-- Update dflash's `kv_end` and `prefill_kv_offset` to honor the standard
-  path's writes (currently those are dflash-internal counters).
-- Test: send image+text request → reply → text-only follow-up → verify
-  no re-prefill of the image-context text.
+The naive plan was: when the standard llama_decode path writes K/V to a
+position, the dflash session sees that data on a subsequent text-only
+call to the same slot. Update dflash's `kv_end` and `prefill_kv_offset`
+to honor the standard path's writes.
 
-### Phase 5: cleanup (1 day)
+**Reality after implementation**: this isn't enough. K/V sharing is half
+the picture — the dflash custom graph also maintains its own SSM state
+for the 48 GDN layers (in `cache.ssm_state`), K_combined sink buffers,
+and anchor snapshots. None of those have an equivalent on the standard
+llama_decode path. So even if dflash detects the K/V advance from a
+vision request, it cannot continue from that position without rebuilding
+SSM state — which means re-running the full forward through all the
+prefix anyway.
 
-- Remove `DFLASH27B_KV_K` / `DFLASH27B_KV_V` env overrides (the K/V type
-  comes from `-ctk`/`-ctv` flags now).
-- Document the share-kv flag in README.
-- Delete dead code in TargetCache for the standalone allocation path.
+**Phase 4 defensive (delivered)**: detect kv_end desync between dflash's
+internal counter and the server's prefill_off. When mismatch (e.g. after
+a vision request used the slot via the standard path), force
+`dflash_session_reset` and full re-prefill. Costs one redundant prefill
+round but keeps the cache consistent. The standard path's K/V writes are
+preserved bit-for-bit since both paths produce identical K/V projections
+from the same target weights — dflash's prefill just overwrites with the
+same values, then advances SSM state correctly.
+
+**Phase 4 full** (true cross-path cache hit on text↔vision interleave)
+would require sharing SSM state too — multi-week refactor of
+`llama_memory_recurrent` to expose F32 SSM tensors per layer to dflash.
+Deferred indefinitely; the use-case (frequent text↔vision interleave on
+same slot) isn't load-bearing for hermes-dark.
+
+### Phase 5: cleanup (delivered)
+
+Done in this RFC update + commit `03ea32aef` and the followup that
+landed Phase 4-defensive:
+
+- Documented the `DFLASH27B_SHARE_KV` flag in README, including the
+  layout-stride caveat and the kv_end-desync defensive reset.
+- Updated the memory savings stack table to include the share-kv row.
+- The `DFLASH27B_KV_K` / `_V` env overrides are KEPT (they still apply
+  on the legacy alloc path; share-kv ignores them since the type comes
+  from `-ctk`/`-ctv`).
+- Dead code removal in TargetCache for the standalone allocation path
+  is NOT done — the legacy path is still default until production
+  validation flips share-kv on by default.
 
 ## Memory savings detail (post phase 5)
 
@@ -187,19 +221,34 @@ Kernels that read dflash K/V:
 | compute scratch | ~2 GiB | ~2 GiB | 0 |
 | **total target-side** | **~22 GiB** | **~13 GiB** | **−9.1 GiB** |
 
-Also removed: redundant prefill on text↔vision context switches, prompt
-cache cross-path hits.
+**Not delivered** (Phase 4 full): cross-path cache hit on text↔vision
+context switches still costs one redundant prefill round (now via the
+defensive `dflash_session_reset` rather than a buffer separation, but
+same latency). Quantitatively: ~30-60s for a 22K-token context on GB10.
+Negligible cost on a text-only agent workload (the defensive check is a
+single int compare, never triggers).
 
 ## Rollout
 
-- Phase 1-2 land behind `--dflash-share-kv=experimental`.
-- Production keeps the standalone path until phase 3 stabilises.
-- Once phase 4 completes, flip default to share-kv on text+vision
-  configs.
+- Phases 1+2+3+4-defensive+5 landed 2026-04-29.
+- Default for `DFLASH27B_SHARE_KV` is **0 (off)** until production
+  validation completes a few days of hermes-dark traffic.
+- Flip to default-on after that, and remove the env (always-on) in a
+  follow-up commit.
 
-## Status today (2026-04-29)
+## Status today (2026-04-29 final)
 
-Investigation done. Layout shown to be view-equivalent. Strides
-non-standard. Phase 1 (kernel stride validation) is the next concrete
-step. Has to wait for a non-production window since it requires server
-restart per iteration.
+DELIVERED: Phase 1 (validation by kernel inspection — no patches needed),
+Phase 2 (borrow API + server-context wiring), Phase 4-defensive (kv_end
+desync guard), Phase 5 (README + RFC docs).
+
+DEFERRED: Phase 4 full (SSM state sharing across paths). Out of scope
+given hermes-dark's text-only-dominant workload.
+
+PRODUCTION STATE: server up with `DFLASH27B_SHARE_KV=1` env, AEON-7 XS
+body, V=Q8 KV, np=2, -c 262144. Stable RAM **~54 GiB total** (38 GiB net
+of OS overhead), full 131K context per slot on both dflash agent and
+mmproj vision paths. Validated text-only at 24, 5K, 22K, 45K context
+points. Vision path validated by code inspection (Phase 1 strides
+confirmed compatible) but not by live request — todo on the validation
+sweep.
