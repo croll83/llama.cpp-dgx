@@ -1332,7 +1332,7 @@ extern "C" int dflash_session_run(dflash_session_t * s,
 
         // K cache row indices for set_rows (TQ3_0 path). Always upload —
         // build_full_attn_block falls back to cpy when use_set_rows is false.
-        if (sg.kv_idxs) {
+        if (sg.kv_idxs && sg.kv_idxs->buffer) {
             std::vector<int32_t> ki(n_tokens);
             for (int i = 0; i < n_tokens; i++) ki[i] = abs_start + i;
             ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * n_tokens);
@@ -1660,7 +1660,7 @@ extern "C" int dflash_session_run(dflash_session_t * s,
             for (int i = 1; i < N; i++) parent_ids[i] = (int32_t)tree.parents[i];
             ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
                                     sizeof(int32_t) * N);
-            if (sg.kv_idxs) {
+            if (sg.kv_idxs && sg.kv_idxs->buffer) {
                 std::vector<int32_t> ki(N);
                 for (int i = 0; i < N; i++) ki[i] = committed + i;
                 ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * N);
@@ -1945,7 +1945,7 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 pos4_buf[3 * q_len + i] = 0;
             }
             ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
-            if (sg.kv_idxs) {
+            if (sg.kv_idxs && sg.kv_idxs->buffer) {
                 std::vector<int32_t> ki(q_len);
                 for (int i = 0; i < q_len; i++) ki[i] = committed + i;
                 ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * q_len);
@@ -1995,7 +1995,7 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 int p = committed + i;
                 p4_single[0] = p; p4_single[1] = p; p4_single[2] = p; p4_single[3] = 0;
                 ggml_backend_tensor_set(sg.positions, p4_single, 0, sizeof(int32_t) * 4);
-                if (sg.kv_idxs) {
+                if (sg.kv_idxs && sg.kv_idxs->buffer) {
                     int32_t ki = committed + i;
                     ggml_backend_tensor_set(sg.kv_idxs, &ki, 0, sizeof(int32_t));
                 }
@@ -2211,7 +2211,7 @@ extern "C" int dflash_session_run(dflash_session_t * s,
                 replay_pos[3 * commit_n + i] = 0;
             }
             ggml_backend_tensor_set(sg.positions, replay_pos.data(), 0, sizeof(int32_t) * 4 * commit_n);
-            if (sg.kv_idxs) {
+            if (sg.kv_idxs && sg.kv_idxs->buffer) {
                 std::vector<int32_t> ki(commit_n);
                 for (int i = 0; i < commit_n; i++) ki[i] = committed + i;
                 ggml_backend_tensor_set(sg.kv_idxs, ki.data(), 0, sizeof(int32_t) * commit_n);
