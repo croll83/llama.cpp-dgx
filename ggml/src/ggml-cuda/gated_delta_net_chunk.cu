@@ -212,9 +212,9 @@ void ggml_cuda_op_gated_delta_net_chunk(ggml_backend_cuda_context & ctx,
         K_bf.get(), (const float *) src_beta->data, g_cum.get(),
         A_sol.get(), B, T, Hh, stream);
 
-    // ── 5. prepare_h: K, V, g_cum, beta, h_initial → h_per_chunk, h_final.
+    // ── 5. prepare_h: K, V, g_cum, A_sol, h_initial → h_per_chunk, h_final.
     launch_gdn_chunk_prepare_h<CHUNK_SIZE, DK, DV_BLK>(
-        K_bf.get(), V_bf.get(), g_cum.get(), (const float *) src_beta->data,
+        K_bf.get(), V_bf.get(), g_cum.get(), A_sol.get(),
         h_init.get(), h_per_chunk.get(), h_final.get(),
         B, T, Hh, DV, stream);
 
