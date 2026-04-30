@@ -10,6 +10,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 // Default tile parameters (overridable from command line).
 #ifndef GDN_CHUNK_SIZE
@@ -445,21 +446,37 @@ inline void launch_gdn_chunk_prepare_h(
 // Intuition: A_sol substitutes the recursive (v_j - k_j h) terms within the
 // chunk; V_eff folds the inter-chunk h dependency into a single modified V.
 //
-// Block layout: 64 threads (= 2 warps), each owns 1 dv_col. Grid:
+// Block layout: 4 warps = 128 threads. Each warp owns rows [w*16, (w+1)*16)
+// of the 64×64 output. wmma 16×16×16 bf16 with fp32 accumulators throughout.
+//
+// Grid:
 //   x = chunk_idx * num_dv_blocks + dv_blk_idx
 //   y = h
 //   z = b
 // (We keep dv_blk fast-varying so consecutive blocks share the same chunk
 // — improves L2 reuse on Q/K/V for the chunk.)
 //
-// Shared budget for S=64, DK=128, DV_BLK=64:
-//   Q_tile      [S, DK]      bf16  = 16 KB
-//   K_tile      [S, DK]      bf16  = 16 KB
-//   V_tile      [S, DV_BLK]  fp32  = 16 KB   (becomes V_eff, then U)
-//   A_or_QK     [S, S]              16 KB   (A bf16 8 KB then QK fp32 16 KB; union)
-//   gc_tile     [S]          fp32  = 0.25 KB
-//   h_tile      [DK, DV_BLK] bf16  = 16 KB
-//   total ≈ 80 KB  (under the 99 KB sm_121a opt-in cap)
+// Shared budget for S=64, DK=128, DV_BLK=64 (= 80.25 KB, under 99 KB):
+//   Q_tile      [S, DK]       bf16  = 16 KB
+//   K_tile      [S, DK]       bf16  = 16 KB
+//   A_tile      [S, S]        bf16  =  8 KB   (later reused as attn_bf16 then O_intra_bf16 storage)
+//   V_tile      [S, DV_BLK]   bf16  =  8 KB   (V → V_eff_bf16 → U_bf16)
+//   h_tile      [DK, DV_BLK]  bf16  = 16 KB
+//   gc_tile     [S]           fp32  = 0.25 KB
+//   scratch_fp32 [S, max(S, DV_BLK)] fp32 = 16 KB (= [64,64], time-mux'd)
+//
+// Pipeline (each step gated by __syncthreads):
+//   load Q, K, V→bf16, A_sol, gc, h
+//   STEP-V: scratch_fp32 ← K @ h  (wmma 16x16x16 bf16 → fp32 acc)
+//           V_tile ← bf16(V - scratch_fp32)
+//   STEP-U: scratch_fp32 ← A_sol @ V_eff  (wmma)
+//           V_tile ← bf16(scratch_fp32)            // V_tile now holds U_bf16
+//   STEP-QK: scratch_fp32 ← Q @ K^T  (wmma, fragment_b col_major)
+//           A_tile ← bf16(scratch_fp32 · decay · tri_lower_with_diag)   // attn matrix
+//   STEP-O_intra: scratch_fp32 ← A_tile @ V_tile  (wmma)         // O_intra fp32
+//                 V_tile ← bf16(scratch_fp32)                    // O_intra_bf16 stash
+//   STEP-Qh: scratch_fp32 ← Q @ h_tile  (wmma)
+//   FINAL: O[t,dv] = bf2f(V_tile[t,dv]) + exp(gc[t]) · scratch_fp32[t,dv]
 template <int CHUNK_SIZE, int DK, int DV_BLK>
 __global__ void gdn_chunk_fused_fwd_kernel(
     const __nv_bfloat16 * __restrict__ Q,           // [B, T, H, DK]
@@ -473,7 +490,10 @@ __global__ void gdn_chunk_fused_fwd_kernel(
 
     constexpr int S = CHUNK_SIZE;
     static_assert(DK == 128 && DV_BLK == 64 && CHUNK_SIZE == 64,
-                  "Phase 3 fused_fwd is hardcoded for S=64, DK=128, DV_BLK=64");
+                  "fused_fwd_wmma is hardcoded for S=64, DK=128, DV_BLK=64");
+
+    namespace wmma = nvcuda::wmma;
+    constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
 
     const int chunk_idx  = blockIdx.x / num_dv_blocks;
     const int dv_blk_idx = blockIdx.x % num_dv_blocks;
@@ -483,22 +503,24 @@ __global__ void gdn_chunk_fused_fwd_kernel(
     const int num_chunks = (T + S - 1) / S;
     const int t_chunk_start = chunk_idx * S;
 
-    const int tid    = threadIdx.x;     // 0..63
-    const int dv_col = tid;             // each thread owns 1 dv column
+    const int tid     = threadIdx.x;     // 0..127
+    const int warp_id = tid >> 5;        // 0..3
+    const int lane    = tid & 31;
+    (void) lane;
 
     extern __shared__ __align__(16) char gdn_fwd_smem[];
-    __nv_bfloat16 * Q_tile = reinterpret_cast<__nv_bfloat16 *>(gdn_fwd_smem);                  //  16 KB
-    __nv_bfloat16 * K_tile = Q_tile + S * DK;                                                   //  16 KB
-    float         * V_tile = reinterpret_cast<float *>(K_tile + S * DK);                       //  16 KB
-    __nv_bfloat16 * A_tile = reinterpret_cast<__nv_bfloat16 *>(V_tile + S * DV_BLK);           //   8 KB used
-    float         * QK_tile = reinterpret_cast<float *>(A_tile);                                // (union — overwritten after step 2)
-    // A_or_QK occupies max(S*S*sizeof(bf16), S*S*sizeof(float)) = 16 KB.
-    float         * gc_tile = reinterpret_cast<float *>(reinterpret_cast<char *>(A_tile) + S * S * sizeof(float));
-    __nv_bfloat16 * h_tile  = reinterpret_cast<__nv_bfloat16 *>(gc_tile + S);
+    __nv_bfloat16 * Q_tile     = reinterpret_cast<__nv_bfloat16 *>(gdn_fwd_smem);                                       // 16 KB
+    __nv_bfloat16 * K_tile     = Q_tile + S * DK;                                                                       // 16 KB
+    __nv_bfloat16 * A_tile     = K_tile + S * DK;                                                                       //  8 KB (later attn_bf16)
+    __nv_bfloat16 * V_tile     = A_tile + S * S;                                                                        //  8 KB (V → V_eff → U → O_intra)
+    __nv_bfloat16 * h_tile     = V_tile + S * DV_BLK;                                                                   // 16 KB
+    float         * gc_tile    = reinterpret_cast<float *>(h_tile + DK * DV_BLK);                                       // 0.25 KB
+    float         * scratch    = gc_tile + S;                                                                           // 16 KB ([S, max(S, DV_BLK)] fp32 = 64*64*4 = 16 KB)
 
-    // ── Cooperative load of all tiles for this chunk.
-    // Q, K: [S, DK] → 64 * 128 = 8192 bf16 elements each → 128 per thread.
-    for (int idx = tid; idx < S * DK; idx += 64) {
+    // ── Cooperative load of all tiles for this chunk (128 threads).
+    // Q, K [S, DK]: 8192 bf16 each → 64 per thread.
+    #pragma unroll 4
+    for (int idx = tid; idx < S * DK; idx += 128) {
         const int t_local = idx / DK;
         const int dk      = idx % DK;
         const int t_g     = t_chunk_start + t_local;
@@ -507,32 +529,32 @@ __global__ void gdn_chunk_fused_fwd_kernel(
         Q_tile[t_local * DK + dk] = ok ? Q[off] : __float2bfloat16(0.0f);
         K_tile[t_local * DK + dk] = ok ? K[off] : __float2bfloat16(0.0f);
     }
-    // V (load to fp32 V_tile directly).
-    for (int idx = tid; idx < S * DV_BLK; idx += 64) {
+    // V [S, DV_BLK]: 4096 bf16 → 32 per thread.
+    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
         const int t_local = idx / DV_BLK;
         const int dv_lc   = idx % DV_BLK;
         const int t_g     = t_chunk_start + t_local;
-        const bool ok     = (t_g < T);
-        __nv_bfloat16 v   = ok ? V[((b_idx * T + t_g) * H + h_idx) * DV + (dv_off + dv_lc)]
-                                : __float2bfloat16(0.0f);
-        V_tile[t_local * DV_BLK + dv_lc] = __bfloat162float(v);
+        __nv_bfloat16 v   = (t_g < T)
+                            ? V[((b_idx * T + t_g) * H + h_idx) * DV + (dv_off + dv_lc)]
+                            : __float2bfloat16(0.0f);
+        V_tile[t_local * DV_BLK + dv_lc] = v;
     }
-    // A_sol: [S, S].
-    for (int idx = tid; idx < S * S; idx += 64) {
+    // A_sol [S, S].
+    for (int idx = tid; idx < S * S; idx += 128) {
         const int i = idx / S;
         const int j = idx % S;
         const int t_g = t_chunk_start + i;
-        const bool ok = (t_g < T);
-        A_tile[i * S + j] = ok ? A_sol[((b_idx * T + t_g) * H + h_idx) * S + j]
-                                : __float2bfloat16(0.0f);
+        A_tile[i * S + j] = (t_g < T)
+                            ? A_sol[((b_idx * T + t_g) * H + h_idx) * S + j]
+                            : __float2bfloat16(0.0f);
     }
-    // g_cum + h_block.
-    for (int t_local = tid; t_local < S; t_local += 64) {
+    for (int t_local = tid; t_local < S; t_local += 128) {
         const int t_g = t_chunk_start + t_local;
-        const bool ok = (t_g < T);
-        gc_tile[t_local] = ok ? g_cumsum[(b_idx * T + t_g) * H + h_idx] : 0.0f;
+        gc_tile[t_local] = (t_g < T) ? g_cumsum[(b_idx * T + t_g) * H + h_idx] : 0.0f;
     }
-    for (int idx = tid; idx < DK * DV_BLK; idx += 64) {
+    // h_tile [DK, DV_BLK]: 8192 bf16 → 64 per thread.
+    #pragma unroll 4
+    for (int idx = tid; idx < DK * DV_BLK; idx += 128) {
         const int dk    = idx / DV_BLK;
         const int dv_lc = idx % DV_BLK;
         const int hpc_off = (((b_idx * num_chunks + chunk_idx) * H + h_idx) * DK + dk) * DV
@@ -541,84 +563,194 @@ __global__ void gdn_chunk_fused_fwd_kernel(
     }
     __syncthreads();
 
-    // ── Step 1: V_eff[t, dv_col] = V[t, dv_col] - (K[t] · h)[dv_col]
-    // Each thread owns its dv_col, sweeps t.
-    #pragma unroll 4
-    for (int t = 0; t < S; ++t) {
-        float kh = 0.0f;
-        #pragma unroll 16
-        for (int dk = 0; dk < DK; ++dk) {
-            kh += __bfloat162float(K_tile[t * DK + dk]) *
-                  __bfloat162float(h_tile[dk * DV_BLK + dv_col]);
-        }
-        V_tile[t * DV_BLK + dv_col] -= kh;
-    }
-    // No __syncthreads needed — each thread modified only its own dv_col column.
+    // ───────────────────────────────────────────────────────────────────────
+    // STEP-V: V_eff = V - K @ h    [S, DV_BLK] = [S, DK] @ [DK, DV_BLK]
+    // Each warp does row-tile [warp_id*16, +15]. 4 col tiles × 8 inner steps each.
+    // ───────────────────────────────────────────────────────────────────────
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-    // ── Step 2: V_eff → U = A_sol · V_eff.
-    // U[i, dv_col] = Σ_{j≤i} A_sol[i, j] · V_eff[j, dv_col]
-    // Iterate i in REVERSE so we can overwrite V_tile[i, dv_col] in-place
-    // without clobbering not-yet-read entries (A is lower-triangular).
-    #pragma unroll 4
-    for (int i = S - 1; i >= 0; --i) {
-        float acc = 0.0f;
-        #pragma unroll 8
-        for (int j = 0; j <= i; ++j) {
-            acc += __bfloat162float(A_tile[i * S + j]) * V_tile[j * DV_BLK + dv_col];
-        }
-        V_tile[i * DV_BLK + dv_col] = acc;   // V_tile is now U_tile
-    }
-    __syncthreads();   // make sure ALL threads finished step 2 before we recycle A_tile space.
-
-    // ── Step 2.5: Compute QK_tile[t, k] = q_t · k_k (only k ≤ t needed).
-    // Reuse the A_tile storage as QK fp32 (16 KB needed; A_tile space was 16 KB).
-    for (int idx = tid; idx < S * S; idx += 64) {
-        const int t = idx / S;
-        const int k = idx % S;
-        if (k <= t) {
-            float dot = 0.0f;
-            #pragma unroll 16
-            for (int dk = 0; dk < DK; ++dk) {
-                dot += __bfloat162float(Q_tile[t * DK + dk]) *
-                       __bfloat162float(K_tile[k * DK + dk]);
+        const int row_off = warp_id * WMMA_M;
+        #pragma unroll
+        for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, K_tile + row_off * DK + dk_block, DK);
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                wmma::load_matrix_sync(b_frag, h_tile + dk_block * DV_BLK + c * WMMA_N, DV_BLK);
+                wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
             }
-            QK_tile[t * S + k] = dot;
-        } else {
-            QK_tile[t * S + k] = 0.0f;
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+                                     DV_BLK, wmma::mem_row_major);
         }
     }
     __syncthreads();
 
-    // ── Step 3: Compute output O[t, dv_col].
-    //   o_intra = Σ_{k≤t} exp(gc[t] - gc[k]) · QK[t, k] · U[k, dv_col]
-    //   o_inter = exp(gc[t]) · (q_t · h)[dv_col]
-    //   y[t, dv_col] = o_intra + o_inter
-    #pragma unroll 4
-    for (int t = 0; t < S; ++t) {
-        const int t_g = t_chunk_start + t;
-        if (t_g >= T) break;
+    // V_tile bf16 ← V - scratch. (Both [S, DV_BLK].)
+    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        float v_eff = __bfloat162float(V_tile[idx]) - scratch[idx];
+        V_tile[idx] = __float2bfloat16(v_eff);
+    }
+    __syncthreads();
 
-        const float gc_t = gc_tile[t];
+    // ───────────────────────────────────────────────────────────────────────
+    // STEP-U: U = A_sol @ V_eff    [S, DV_BLK] = [S, S] @ [S, DV_BLK]
+    // ───────────────────────────────────────────────────────────────────────
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-        // Intra-chunk
-        float o_intra = 0.0f;
-        #pragma unroll 8
-        for (int k = 0; k <= t; ++k) {
-            const float decay = __expf(gc_t - gc_tile[k]);
-            o_intra += decay * QK_tile[t * S + k] * V_tile[k * DV_BLK + dv_col];
+        const int row_off = warp_id * WMMA_M;
+        #pragma unroll
+        for (int kb = 0; kb < S; kb += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, A_tile + row_off * S + kb, S);
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + c * WMMA_N, DV_BLK);
+                wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
+            }
         }
-
-        // Inter-chunk
-        float qh = 0.0f;
-        #pragma unroll 16
-        for (int dk = 0; dk < DK; ++dk) {
-            qh += __bfloat162float(Q_tile[t * DK + dk]) *
-                  __bfloat162float(h_tile[dk * DV_BLK + dv_col]);
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+                                     DV_BLK, wmma::mem_row_major);
         }
-        const float o_inter = __expf(gc_t) * qh;
+    }
+    __syncthreads();
 
-        const float y = o_intra + o_inter;
-        const int o_off = ((b_idx * T + t_g) * H + h_idx) * DV + (dv_off + dv_col);
+    // V_tile bf16 ← U_fp32 cast. (V_tile now holds U_bf16, ready for the
+    // attn @ U matmul below.)
+    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        V_tile[idx] = __float2bfloat16(scratch[idx]);
+    }
+    __syncthreads();
+
+    // ───────────────────────────────────────────────────────────────────────
+    // STEP-QK: QK = Q @ K^T    [S, S] = [S, DK] @ [DK, S]
+    // K^T is achieved via fragment_b col_major (logical view of K_tile).
+    // ───────────────────────────────────────────────────────────────────────
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+
+        const int row_off = warp_id * WMMA_M;
+        #pragma unroll
+        for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, Q_tile + row_off * DK + dk_block, DK);
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                // Load K viewed as [DK, S] col_major. Tile starting at logical
+                // (dk_block, c*16): base = K_tile + (c*16)*DK + dk_block, ldm=DK.
+                wmma::load_matrix_sync(b_frag,
+                    K_tile + (c * WMMA_N) * DK + dk_block, DK);
+                wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
+            }
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * S + c * WMMA_N, acc[c],
+                                     S, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    // attn[t, k] = scratch[t, k] · exp(gc[t] - gc[k])  for k ≤ t  else 0.
+    // Cast to bf16 in A_tile (was the A_sol storage; A_sol is no longer needed).
+    for (int idx = tid; idx < S * S; idx += 128) {
+        const int t = idx / S;
+        const int k = idx % S;
+        float v = 0.0f;
+        if (k <= t) {
+            v = scratch[idx] * __expf(gc_tile[t] - gc_tile[k]);
+        }
+        A_tile[idx] = __float2bfloat16(v);
+    }
+    __syncthreads();
+
+    // ───────────────────────────────────────────────────────────────────────
+    // STEP-O_intra: O_intra = attn @ U   [S, DV_BLK] = [S, S] @ [S, DV_BLK]
+    // ───────────────────────────────────────────────────────────────────────
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+
+        const int row_off = warp_id * WMMA_M;
+        #pragma unroll
+        for (int kb = 0; kb < S; kb += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, A_tile + row_off * S + kb, S);
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + c * WMMA_N, DV_BLK);
+                wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
+            }
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+                                     DV_BLK, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    // V_tile bf16 ← O_intra_fp32 cast. (V_tile becomes O_intra_bf16 stash.)
+    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        V_tile[idx] = __float2bfloat16(scratch[idx]);
+    }
+    __syncthreads();
+
+    // ───────────────────────────────────────────────────────────────────────
+    // STEP-Qh: Qh = Q @ h_tile    [S, DV_BLK] = [S, DK] @ [DK, DV_BLK]
+    // ───────────────────────────────────────────────────────────────────────
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+
+        const int row_off = warp_id * WMMA_M;
+        #pragma unroll
+        for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, Q_tile + row_off * DK + dk_block, DK);
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                wmma::load_matrix_sync(b_frag, h_tile + dk_block * DV_BLK + c * WMMA_N, DV_BLK);
+                wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
+            }
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+                                     DV_BLK, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    // ── FINAL: O[t, dv] = bf2f(V_tile[t,dv]) + exp(gc[t]) · scratch[t,dv]
+    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        const int t     = idx / DV_BLK;
+        const int dv_lc = idx % DV_BLK;
+        const int t_g   = t_chunk_start + t;
+        if (t_g >= T) continue;
+        const float o_intra = __bfloat162float(V_tile[idx]);
+        const float o_inter = __expf(gc_tile[t]) * scratch[idx];
+        const float y       = o_intra + o_inter;
+        const int   o_off   = ((b_idx * T + t_g) * H + h_idx) * DV + (dv_off + dv_lc);
         O[o_off] = __float2bfloat16(y);
     }
 }
@@ -637,13 +769,16 @@ inline void launch_gdn_chunk_fused_fwd(
     int B, int T, int H, int DV, cudaStream_t stream) {
 
     constexpr int S = CHUNK_SIZE;
-    constexpr size_t SMEM_Q   = S * DK     * sizeof(__nv_bfloat16);
-    constexpr size_t SMEM_K   = S * DK     * sizeof(__nv_bfloat16);
-    constexpr size_t SMEM_V   = S * DV_BLK * sizeof(float);
-    constexpr size_t SMEM_AQK = S * S      * sizeof(float);   // union: max of bf16 A and fp32 QK
-    constexpr size_t SMEM_GC  = S          * sizeof(float);
-    constexpr size_t SMEM_H   = DK * DV_BLK* sizeof(__nv_bfloat16);
-    constexpr size_t SMEM_TOTAL = SMEM_Q + SMEM_K + SMEM_V + SMEM_AQK + SMEM_GC + SMEM_H;
+    // wmma layout: Q+K bf16, A bf16, V_tile bf16 (V→V_eff→U→O_intra), h bf16,
+    // gc fp32, scratch fp32 [S, max(S, DV_BLK)] = 16 KB.
+    constexpr size_t SMEM_Q       = S * DK     * sizeof(__nv_bfloat16);   // 16 KB
+    constexpr size_t SMEM_K       = S * DK     * sizeof(__nv_bfloat16);   // 16 KB
+    constexpr size_t SMEM_A       = S * S      * sizeof(__nv_bfloat16);   //  8 KB
+    constexpr size_t SMEM_V       = S * DV_BLK * sizeof(__nv_bfloat16);   //  8 KB
+    constexpr size_t SMEM_H       = DK * DV_BLK* sizeof(__nv_bfloat16);   // 16 KB
+    constexpr size_t SMEM_GC      = S          * sizeof(float);           //  0.25 KB
+    constexpr size_t SMEM_SCRATCH = (size_t)(S * (S > DV_BLK ? S : DV_BLK)) * sizeof(float);  // 16 KB
+    constexpr size_t SMEM_TOTAL   = SMEM_Q + SMEM_K + SMEM_A + SMEM_V + SMEM_H + SMEM_GC + SMEM_SCRATCH;
     static_assert(SMEM_TOTAL <= 99 * 1024,
                   "fused_fwd shared budget exceeded sm_121a 99 KB opt-in cap");
 
@@ -655,7 +790,7 @@ inline void launch_gdn_chunk_fused_fwd(
     const int num_chunks    = (T + S - 1) / S;
     const int num_dv_blocks = DV / DV_BLK;
     dim3 grid(num_chunks * num_dv_blocks, H, B);
-    dim3 block(64);
+    dim3 block(128);    // 4 warps for wmma
     kernel_ptr<<<grid, block, SMEM_TOTAL, stream>>>(
         Q, K, V, A_sol, g_cumsum, h_per_chunk, O, B, T, H, DV, num_dv_blocks);
 }

@@ -558,3 +558,48 @@ Performance is at parity within measurement noise. The first cut uses scalar fp3
 - New: `tests/test_gdn_chunk.cu`
 - Edited: `ggml/src/ggml-cuda/gated_delta_net.cuh` (added chunk + dispatch declarations)
 - Edited: `ggml/src/ggml-cuda/ggml-cuda.cu` (route GGML_OP_GATED_DELTA_NET through dispatcher)
+
+---
+
+## 9. Phase 6 deep-tuning autonomous run (2026-04-30 cont.)
+
+### 9.1 Profiling infrastructure
+- `tests/test-gdn-chunk.cu --bench N`: CUDA-event microbench, runs each kernel + full pipeline N times after 3-iter warmup, reports min/median/mean/max us.
+- Two fixtures: small (B=2 T=128 H=4 DK=DV=128 S=64) for unit tests; production (B=1 T=192 H=16 ...) matching dflash-prefill-ubatch=192 for representative profiling.
+
+### 9.2 BASELINE (post-Phase-5 commit 6e9d72f38)
+
+Production shape (B=1 T=192 H=16, 200 iters):
+
+| kernel | median (us) | % of total |
+|---|---|---|
+| cumsum | 2.62 | 0.2% |
+| kkt_solve | 122.18 | 7.9% |
+| **prepare_h** | **1042.85** | **67.8%** |
+| fused_fwd | 371.26 | 24.1% |
+| FULL pipeline | 1537.28 | — |
+
+Pipeline overlap savings: only 1.6 us (sequential by data deps).
+
+### 9.3 Bottleneck analysis & priority revision
+prepare_h dominates because the per-token-within-chunk inner loop does 200 fp32 ops per thread per token × 64 tokens × 3 chunks = sequential, scalar, no tensor cores. fused_fwd at 24% is the next target. cumsum is negligible.
+
+Revised priority order:
+- Step 2: fused_fwd → wmma for V_eff / QK / U=A·V_eff / Q@h (warmup for tensor-core toolchain + 24% speedup)
+- Step 1 (renamed Step 8): prepare_h rewrite using A_sol-formulation: V_eff=V-K@h_start → U=A_sol·V_eff → h_end=exp(g_total)·h_start + K^T·decay(U). Three large tensor-core matmuls per chunk instead of S sequential per-token loop. Biggest single win expected.
+- Step 9: kkt_solve KK_dot phase via wmma (small impact).
+- Steps 6-7: cp.async + occupancy tuning.
+
+
+### 9.4 Step 2 — wmma fused_fwd (4 warps, 16x16x16 bf16 wmma fragments)
+
+Replaced scalar fused_fwd with 5 wmma matmuls (V-Kh, A·V_eff, Q·K^T col_major, attn·U, Q·h). 4 warps × 4 col tiles per matmul. bf16 round-trip on V_eff, U, O_intra (negligible accuracy hit: mean_abs 1.4e-3 → 2.4e-3, well under tolerance).
+
+| | baseline | step 2 | speedup |
+|---|---|---|---|
+| fused_fwd (median us) | 371.26 | 55.74 | **6.66×** |
+| pipeline total (us) | 1537.28 | 1217.89 | 1.26× |
+| fused_fwd % of total | 24.1% | 4.6% | — |
+
+prepare_h is now 85% of pipeline. Step 3 (rewrite with A_sol-based formulation + wmma) becomes the highest-impact remaining work.
+

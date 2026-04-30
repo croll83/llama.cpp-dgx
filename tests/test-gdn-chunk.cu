@@ -13,6 +13,7 @@
 //       -I /home/jarvis/llama-cpp-v5/ggml/include \
 //       -o /tmp/test_gdn_chunk
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -353,18 +354,175 @@ static int test_fused_fwd(const Fixture & f) {
     return pass ? 0 : 1;
 }
 
+// ─── Micro-benchmark mode ──────────────────────────────────────────────────
+// Times each kernel individually using CUDA events, plus the full pipeline.
+// Reports min/median/mean over N iterations after a warmup.
+
+struct BenchStats {
+    double min_us, median_us, mean_us, max_us;
+};
+
+static BenchStats compute_stats(std::vector<double> & ms) {
+    std::sort(ms.begin(), ms.end());
+    BenchStats s;
+    s.min_us    = ms.front() * 1000.0;
+    s.max_us    = ms.back()  * 1000.0;
+    s.median_us = ms[ms.size() / 2] * 1000.0;
+    double sum = 0.0;
+    for (double v : ms) sum += v;
+    s.mean_us = (sum / ms.size()) * 1000.0;
+    return s;
+}
+
+static int bench(const Fixture & f, int n_iters) {
+    if (f.DK != 128 || f.DV != 128 || f.S != 64) {
+        std::printf("BENCH: SKIP (kernels only instantiated for DK=128 DV=128 S=64)\n");
+        return 0;
+    }
+    std::printf("\n=== microbench: B=%d T=%d H=%d DK=%d DV=%d S=%d  iters=%d ===\n",
+                f.B, f.T, f.H, f.DK, f.DV, f.S, n_iters);
+
+    const int num_chunks = (f.T + f.S - 1) / f.S;
+    const size_t n_BTH    = (size_t) f.B * f.T * f.H;
+    const size_t n_BTH_DK = n_BTH * f.DK;
+    const size_t n_BTH_DV = n_BTH * f.DV;
+    const size_t n_BTH_S  = n_BTH * f.S;
+    const size_t n_BHDD   = (size_t) f.B * f.H * f.DK * f.DV;
+    const size_t n_HPC    = (size_t) f.B * num_chunks * f.H * f.DK * f.DV;
+
+    float *d_g, *d_g_cum, *d_beta;
+    __nv_bfloat16 *d_Q, *d_K, *d_V, *d_A, *d_h0, *d_hpc, *d_hf, *d_O;
+    CUDA_CHECK(cudaMalloc(&d_g,     n_BTH    * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_cum, n_BTH    * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_beta,  n_BTH    * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Q,     n_BTH_DK * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_K,     n_BTH_DK * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_V,     n_BTH_DV * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_A,     n_BTH_S  * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_h0,    n_BHDD   * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_hpc,   n_HPC    * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_hf,    n_BHDD   * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_O,     n_BTH_DV * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMemcpy(d_g,     f.g.data(),         n_BTH    * sizeof(float),         cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_g_cum, f.g_cum_exp.data(), n_BTH    * sizeof(float),         cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_beta,  f.beta.data(),      n_BTH    * sizeof(float),         cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Q,     f.Q_bits.data(),    n_BTH_DK * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_K,     f.K_bits.data(),    n_BTH_DK * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_V,     f.V_bits.data(),    n_BTH_DV * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A,     f.A_sol_exp.data(), n_BTH_S  * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_h0,    f.h_initial.data(), n_BHDD   * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hpc,   f.hpc_exp.data(),   n_HPC    * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    auto bench_kernel = [&](const char * name, auto && launcher) {
+        // warmup
+        for (int i = 0; i < 3; ++i) launcher();
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<double> times(n_iters);
+        for (int i = 0; i < n_iters; ++i) {
+            CUDA_CHECK(cudaEventRecord(start));
+            launcher();
+            CUDA_CHECK(cudaEventRecord(stop));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+            times[i] = ms;
+        }
+        BenchStats s = compute_stats(times);
+        std::printf("  %-14s: min=%7.2f us  median=%7.2f us  mean=%7.2f us  max=%7.2f us\n",
+                    name, s.min_us, s.median_us, s.mean_us, s.max_us);
+        return s.median_us;
+    };
+
+    // 1. cumsum
+    double t_cumsum = bench_kernel("cumsum", [&]{
+        dim3 grid(num_chunks, f.H, f.B);
+        dim3 block(f.S);
+        gdn_chunk_local_cumsum_kernel<<<grid, block>>>(d_g, d_g_cum, f.B, f.T, f.H, f.S);
+    });
+
+    // 2. kkt_solve
+    double t_kkt = bench_kernel("kkt_solve", [&]{
+        launch_gdn_chunk_kkt_solve<64, 128>(d_K, d_beta, d_g_cum, d_A, f.B, f.T, f.H, 0);
+    });
+
+    // 3. prepare_h
+    double t_ph = bench_kernel("prepare_h", [&]{
+        launch_gdn_chunk_prepare_h<64, 128, 64>(
+            d_K, d_V, d_g_cum, d_beta, d_h0, d_hpc, d_hf,
+            f.B, f.T, f.H, f.DV, 0);
+    });
+
+    // 4. fused_fwd
+    double t_ff = bench_kernel("fused_fwd", [&]{
+        launch_gdn_chunk_fused_fwd<64, 128, 64>(
+            d_Q, d_K, d_V, d_A, d_g_cum, d_hpc, d_O,
+            f.B, f.T, f.H, f.DV, 0);
+    });
+
+    // 5. full pipeline (chained, no upload/download)
+    double t_pipe = bench_kernel("FULL pipeline", [&]{
+        dim3 grid(num_chunks, f.H, f.B);
+        dim3 block(f.S);
+        gdn_chunk_local_cumsum_kernel<<<grid, block>>>(d_g, d_g_cum, f.B, f.T, f.H, f.S);
+        launch_gdn_chunk_kkt_solve<64, 128>(d_K, d_beta, d_g_cum, d_A, f.B, f.T, f.H, 0);
+        launch_gdn_chunk_prepare_h<64, 128, 64>(
+            d_K, d_V, d_g_cum, d_beta, d_h0, d_hpc, d_hf,
+            f.B, f.T, f.H, f.DV, 0);
+        launch_gdn_chunk_fused_fwd<64, 128, 64>(
+            d_Q, d_K, d_V, d_A, d_g_cum, d_hpc, d_O,
+            f.B, f.T, f.H, f.DV, 0);
+    });
+
+    const double sum_indiv = t_cumsum + t_kkt + t_ph + t_ff;
+    std::printf("  ─────────────────────────────────────────────────────\n");
+    std::printf("  Σ individual = %.2f us   pipeline = %.2f us   overlap savings = %.2f us\n",
+                sum_indiv, t_pipe, sum_indiv - t_pipe);
+    std::printf("  bottleneck breakdown (median):\n");
+    std::printf("    cumsum:    %5.1f%%  (%.2f us)\n", 100.0 * t_cumsum / sum_indiv, t_cumsum);
+    std::printf("    kkt_solve: %5.1f%%  (%.2f us)\n", 100.0 * t_kkt    / sum_indiv, t_kkt);
+    std::printf("    prepare_h: %5.1f%%  (%.2f us)\n", 100.0 * t_ph     / sum_indiv, t_ph);
+    std::printf("    fused_fwd: %5.1f%%  (%.2f us)\n", 100.0 * t_ff     / sum_indiv, t_ff);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    cudaFree(d_g); cudaFree(d_g_cum); cudaFree(d_beta);
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_A);
+    cudaFree(d_h0); cudaFree(d_hpc); cudaFree(d_hf); cudaFree(d_O);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     const char * fixture = (argc > 1) ? argv[1] : "/tmp/gdn_chunk_fixture.bin";
+    int  n_bench_iters   = 0;
+    bool do_tests        = true;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--bench") == 0) {
+            n_bench_iters = (i + 1 < argc) ? std::atoi(argv[i + 1]) : 100;
+            i++;
+        } else if (std::strcmp(argv[i], "--no-tests") == 0) {
+            do_tests = false;
+        }
+    }
+
     Fixture f = load_fixture(fixture);
     std::printf("loaded fixture %s: B=%d T=%d H=%d DK=%d DV=%d S=%d\n",
                 fixture, f.B, f.T, f.H, f.DK, f.DV, f.S);
 
     int fails = 0;
-    fails += test_cumsum(f);
-    fails += test_kkt_solve(f);
-    fails += test_prepare_h(f);
-    fails += test_fused_fwd(f);
-
-    std::printf("\n=== %d test(s) failed ===\n", fails);
+    if (do_tests) {
+        fails += test_cumsum(f);
+        fails += test_kkt_solve(f);
+        fails += test_prepare_h(f);
+        fails += test_fused_fwd(f);
+        std::printf("\n=== %d test(s) failed ===\n", fails);
+    }
+    if (n_bench_iters > 0) {
+        bench(f, n_bench_iters);
+    }
     return fails;
 }
