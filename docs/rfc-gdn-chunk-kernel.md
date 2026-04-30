@@ -603,3 +603,30 @@ Replaced scalar fused_fwd with 5 wmma matmuls (V-Kh, A·V_eff, Q·K^T col_major,
 
 prepare_h is now 85% of pipeline. Step 3 (rewrite with A_sol-based formulation + wmma) becomes the highest-impact remaining work.
 
+
+### 9.5 Step 2.5 (urgent fix) + Step 3 — math correction + wmma prepare_h
+
+While writing the new prepare_h with the A_sol-based formulation, a numerical mismatch (max_abs 2.19 vs reference 0.087) revealed THREE coordinated math bugs in the Phase 1 kkt_solve_ref + fused_fwd_ref + their CUDA kernels:
+
+1. kkt_solve L exponent: had `exp(gc[k-1] - gc[i])`, correct is `exp(gc[i-1] - gc[k])`.
+2. kkt_solve solve form: had `(I - L) X = diag(β)`, correct is `(I + L) X = diag(β)`.
+3. fused_fwd V_eff: had `V - K @ h_c`, correct is `V - exp(gc[t-1]) · K @ h_c`.
+
+Validated via gdn_math_check.py: with all three fixes the chunk formulation matches the per-token recurrence bit-exactly (diff = 0.0). Without the fixes, diff ~3% per element — the "quasi identico" hermes-dark output observed earlier was the model tolerating a small systematic drift, not bit-equivalence.
+
+After fixing both Python references and CUDA kernels:
+
+| step | pipeline (us) | speedup vs baseline |
+|---|---|---|
+| Baseline (commit 6e9d72f38) | 1537 | 1× |
+| Step 2 (wmma fused_fwd, math BUG still) | 1218 | 1.26× |
+| **Step 2.5 + Step 3** (math fix + wmma prepare_h v2) | **237** | **6.49×** |
+
+Per-kernel breakdown after Step 3 (B=1 T=192 H=16):
+- cumsum: 2.6 us (1.1%)
+- **kkt_solve: 117 us (49%)** ← new bottleneck
+- prepare_h: 64 us (26.6%)
+- fused_fwd: 56 us (23.3%)
+
+Production smoke test: chunked path with corrected math produces coherent output on 150-token prompt via /v1/completions. No regressions. NOTE: hermes-dark E2E re-validation needed since the corrected outputs are now bit-equivalent to per-token (whereas the buggy version had ~3% per-element drift).
+

@@ -252,7 +252,13 @@ static int test_prepare_h(const Fixture & f) {
     CUDA_CHECK(cudaMemset(d_hpc,    0, n_HPC  * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMemset(d_hfinal, 0, n_BHDD * sizeof(__nv_bfloat16)));
 
-    launch_gdn_chunk_prepare_h<64, 128, 64>(d_K, d_V, d_g_cum, d_beta,
+    // Pass A_sol_exp (precomputed reference) into prepare_h.
+    __nv_bfloat16 * d_A_sol_in;
+    CUDA_CHECK(cudaMalloc(&d_A_sol_in, (size_t) f.B * f.T * f.H * f.S * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMemcpy(d_A_sol_in, f.A_sol_exp.data(),
+                          (size_t) f.B * f.T * f.H * f.S * sizeof(__nv_bfloat16),
+                          cudaMemcpyHostToDevice));
+    launch_gdn_chunk_prepare_h<64, 128, 64>(d_K, d_V, d_g_cum, d_A_sol_in,
                                               d_h0, d_hpc, d_hfinal,
                                               f.B, f.T, f.H, f.DV, 0);
     CUDA_CHECK(cudaGetLastError());
@@ -280,6 +286,7 @@ static int test_prepare_h(const Fixture & f) {
     CUDA_CHECK(cudaFree(d_h0));
     CUDA_CHECK(cudaFree(d_hpc));
     CUDA_CHECK(cudaFree(d_hfinal));
+    CUDA_CHECK(cudaFree(d_A_sol_in));
     return pass ? 0 : 1;
 }
 
@@ -453,7 +460,7 @@ static int bench(const Fixture & f, int n_iters) {
     // 3. prepare_h
     double t_ph = bench_kernel("prepare_h", [&]{
         launch_gdn_chunk_prepare_h<64, 128, 64>(
-            d_K, d_V, d_g_cum, d_beta, d_h0, d_hpc, d_hf,
+            d_K, d_V, d_g_cum, d_A, d_h0, d_hpc, d_hf,
             f.B, f.T, f.H, f.DV, 0);
     });
 
@@ -471,7 +478,7 @@ static int bench(const Fixture & f, int n_iters) {
         gdn_chunk_local_cumsum_kernel<<<grid, block>>>(d_g, d_g_cum, f.B, f.T, f.H, f.S);
         launch_gdn_chunk_kkt_solve<64, 128>(d_K, d_beta, d_g_cum, d_A, f.B, f.T, f.H, 0);
         launch_gdn_chunk_prepare_h<64, 128, 64>(
-            d_K, d_V, d_g_cum, d_beta, d_h0, d_hpc, d_hf,
+            d_K, d_V, d_g_cum, d_A, d_h0, d_hpc, d_hf,
             f.B, f.T, f.H, f.DV, 0);
         launch_gdn_chunk_fused_fwd<64, 128, 64>(
             d_Q, d_K, d_V, d_A, d_g_cum, d_hpc, d_O,

@@ -36,6 +36,14 @@ def chunk_local_cumsum_ref(g: torch.Tensor, chunk_size: int) -> torch.Tensor:
 
 
 def kkt_solve_ref(K, beta, g_cumsum, chunk_size):
+    """Compute A_sol such that u = A_sol @ V_eff where:
+        u_t          = β_t (v_t - k_t · h_{t-1})         (per-token recurrence)
+        V_eff[t]     = v_t - exp(gc[t-1]) (k_t · h_start)
+        A_sol = (I + L)^{-1} diag(β)
+        L[i, k]      = β_i (k_i · k_k) exp(gc[i-1] - gc[k])  for k<i  (gc[-1]:=0)
+
+    Forward sub: X[i, j] = β_i δ_ij - Σ_{k<i} L[i, k] X[k, j]
+    """
     B, T, H, DK = K.shape
     S = chunk_size
     K_f = K.float()
@@ -49,20 +57,23 @@ def kkt_solve_ref(K, beta, g_cumsum, chunk_size):
         beta_chunk = beta[:, a:b, :]
         g_chunk    = g_cumsum[:, a:b, :]
         KK = torch.einsum('bihd,bkhd->bhik', K_chunk, K_chunk)
-        g_perm = g_chunk.permute(0, 2, 1)
-        g_prev = torch.zeros_like(g_perm)
-        g_prev[..., 1:] = g_perm[..., :-1]
-        g_diff = g_prev.unsqueeze(-2) - g_perm.unsqueeze(-1)
-        beta_perm = beta_chunk.permute(0, 2, 1).unsqueeze(-1)
+        # g_im1[i] = gc[i-1] for i>=1, else 0  (chunk-local, gc[-1]:=0).
+        g_perm = g_chunk.permute(0, 2, 1)                # [B, H, S]
+        g_im1  = torch.zeros_like(g_perm)
+        g_im1[..., 1:] = g_perm[..., :-1]
+        # L[i, k] = β_i · KK[i, k] · exp(g_im1[i] - gc[k]).
+        g_diff = g_im1.unsqueeze(-1) - g_perm.unsqueeze(-2)  # [B, H, i, k]
+        beta_perm = beta_chunk.permute(0, 2, 1).unsqueeze(-1) # [B, H, i, 1]
         L_full = beta_perm * KK * torch.exp(g_diff)
         mask = torch.tril(torch.ones(S_eff, S_eff, device=K.device), diagonal=-1)
         L = L_full * mask
+        # Solve (I + L) X = diag(β).  Forward sub: X[i, :] = β_i e_i - L[i, :i] X[:i, :].
         X = torch.zeros((B, H, S_eff, S_eff), dtype=torch.float32, device=K.device)
         diag_beta = beta_chunk.permute(0, 2, 1)
         for i in range(S_eff):
             X[..., i, i] = diag_beta[..., i]
             if i > 0:
-                X[..., i, :i] = (L[..., i:i+1, :i] @ X[..., :i, :i]).squeeze(-2)
+                X[..., i, :i] = -(L[..., i:i+1, :i] @ X[..., :i, :i]).squeeze(-2)
         X_perm = X.permute(0, 2, 1, 3)
         A_sol[:, a:b, :, :S_eff] = X_perm
     return A_sol
@@ -114,8 +125,13 @@ def fused_fwd_ref(Q, K, V, A_sol, g_cumsum, h_per_chunk, chunk_size):
         A_chunk  = A_f[:, a:b, :, :S_eff]
         gc_chunk = g_cumsum[:, a:b]
         h_c      = h_f[:, c]
+        # V_eff[t, dv] = V[t, dv] - exp(gc[t-1]) (K[t]·h_c)[dv]   gc[-1]:=0
+        gc_perm0  = gc_chunk.permute(0, 2, 1)
+        gc_im1    = torch.zeros_like(gc_perm0)
+        gc_im1[..., 1:] = gc_perm0[..., :-1]
+        gc_im1_t  = gc_im1.permute(0, 2, 1)
         Kh    = torch.einsum('bthd,bhde->bthe', K_chunk, h_c)
-        V_eff = V_chunk - Kh
+        V_eff = V_chunk - torch.exp(gc_im1_t).unsqueeze(-1) * Kh
         A_perm = A_chunk.permute(0, 2, 1, 3)
         V_perm = V_eff.permute(0, 2, 1, 3)
         U_perm = A_perm @ V_perm
