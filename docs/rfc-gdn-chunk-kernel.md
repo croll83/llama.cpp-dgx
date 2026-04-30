@@ -668,3 +668,54 @@ Microbench (B=1 T=192 H=16, 200 iters):
 
 Cumulative speedup vs baseline: 1537 \xe2\x86\x92 162 us = **9.5\xc3\x97**.
 
+
+### 9.8 FINAL VERDICT — sweet spot found, end of autonomous run
+
+After Steps 2-5 the chunked GDN kernel pipeline is 9.5\xc3\x97 faster on microbench
+(1537 us \xe2\x86\x92 162 us per call on B=1 T=192 H=16). However the production
+batched-bench on AEON-XS NVFP4 shows the speedup does **NOT** translate
+end-to-end:
+
+| PP | Step 5 (9.5\xc3\x97 GDN) | Phase 5 baseline | per-token kernel |
+|---|---|---|---|
+| 128 | 455.7 t/s | 453.9 t/s | 451.2 t/s |
+| 256 | 525.3 t/s | 524.6 t/s | 528.2 t/s |
+| 512 | 538.7 t/s | 542.5 t/s | 542.6 t/s |
+
+The model is dominated by the FFN/MoE NVFP4 matmuls, not the GDN op. GDN was
+already only ~1-2% of total prefill time, so a 9.5\xc3\x97 GDN speedup saves
+~1.8% of total prefill at most \xe2\x80\x94 within measurement noise.
+
+**Numerical equivalence test (PASSED):** with greedy decoding (temperature=0,
+fixed seed) on a ~110-token English prompt with chunked path active vs
+GGML_GDN_CHUNK_DISABLE=1, the model produces **bit-identical** 40-token
+continuations. This validates that the math fix in Step 2.5+3 made the
+chunked path truly equivalent to the per-token kernel (the pre-fix version
+had a small systematic ~3% per-element drift that the model tolerated
+visually but was not actually equivalent).
+
+**Conclusions:**
+
+1. The from-scratch GB10-tiled chunked GDN kernel is the right answer for
+   sm_120/121 hardware where FlashQLA's 192 KB shared budget doesn\'t fit.
+2. The pipeline is now mathematically correct AND runs at 9.5\xc3\x97 the
+   original scalar implementation. wmma 16x16x16 bf16 with fp32 accumulators
+   is the building block, used for 9 matmuls across the 4 kernels.
+3. End-to-end production speedup is neutral because GDN is not the
+   bottleneck on AEON-XS NVFP4. To realise the GDN speedup, future work
+   should focus on the FFN/MoE NVFP4 path (out of scope for this RFC).
+4. Default ON, GGML_GDN_CHUNK_DISABLE=1 escape hatch retained.
+
+**Sweet spot commit:** dee9930f8 (Step 5).
+
+**Final tree commits:**
+- 6e9d72f38 (Phase 1-5: scaffolding + numerical-correct scalar kernels)
+- dfcd5669a (Step 2: wmma fused_fwd, math BUG still latent)
+- 3c66666df (Step 2.5+3: kkt+V_eff math fix + wmma prepare_h)
+- 11e606da4 (Step 4: wmma kkt_solve KK_dot)
+- dee9930f8 (Step 5: 8-warp expansion + L precompute) **\xe2\x86\x90 sweet spot**
+
+End of autonomous Phase 6 run. No further tuning without a new bottleneck
+(e.g., larger batches, smaller models, or after the FFN/MoE optimisation
+exposes GDN as the limiter).
+
