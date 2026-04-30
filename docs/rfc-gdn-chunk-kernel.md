@@ -645,3 +645,26 @@ Block size 64 \xe2\x86\x92 128 threads. Shared budget unchanged (49 KB).
 
 All three big kernels now balanced: kkt_solve 34%, prepare_h 34%, fused_fwd 31%. cumsum negligible (1.4%).
 
+
+### 9.7 Step 5 — 8-warp prepare_h + fused_fwd, L-precompute in kkt_solve
+
+Two micro-optimisations:
+
+1. Block size 4 \xe2\x86\x92 8 warps in prepare_h and fused_fwd. Output [64, 64]
+   = 16 wmma tiles redistributed to 8 warps (\xc3\x97 2 col tiles each instead of 4
+   per warp). Same work, 2\xc3\x97 parallelism on tensor cores.
+2. Precompute L = beta * KK * exp(gc[i-1] - gc[k]) in parallel before
+   forward sub (overwrites KK_dot fp32 buffer). Forward sub inner loop
+   becomes a pure mul-add (no per-iteration expf).
+
+Microbench (B=1 T=192 H=16, 200 iters):
+
+| | Step 4 | Step 5 |
+|---|---|---|
+| kkt_solve  | 63 us  | 59 us  |
+| prepare_h  | 64 us  | 48 us  |
+| fused_fwd  | 57 us  | 54 us  |
+| pipeline   | 183 us | 162 us |
+
+Cumulative speedup vs baseline: 1537 \xe2\x86\x92 162 us = **9.5\xc3\x97**.
+

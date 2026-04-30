@@ -162,11 +162,21 @@ __global__ void gdn_chunk_kkt_solve_kernel(
     }
     __syncthreads();
 
-    // Initialise X = diag(beta) (cooperatively across 128 threads).
+    // Initialise X = diag(beta) AND precompute L matrix (overwriting KK_dot)
+    // in parallel: L[i, k] = β_i KK[i, k] exp(gc[i-1] - gc[k]) for k<i, else 0.
+    // gc[-1] := 0 for the i=0 case (which has no k<0 entries anyway).
     for (int idx = tid; idx < S * S; idx += 128) {
-        const int row = idx / S;
-        const int col = idx % S;
-        X[idx] = (row == col) ? beta_t[row] : 0.0f;
+        const int i = idx / S;
+        const int k = idx % S;
+        // X init.
+        X[idx] = (i == k) ? beta_t[i] : 0.0f;
+        // L[i, k]: only valid for k<i.
+        float L_ik = 0.0f;
+        if (k < i) {
+            const float g_im1 = (i > 0) ? g_t[i - 1] : 0.0f;
+            L_ik = beta_t[i] * KK_dot[idx] * __expf(g_im1 - g_t[k]);
+        }
+        KK_dot[idx] = L_ik;     // reuse KK_dot storage; now holds L.
     }
     __syncthreads();
 
@@ -177,17 +187,12 @@ __global__ void gdn_chunk_kkt_solve_kernel(
     const bool in_range = (j < S) && (t_for_thread < T);
 
     // Forward substitution: solve (I + L) X = diag(β) row by row.
-    //   X[0, j] = β_0 δ_{0,j}  (already from init)
-    //   X[i, :] = β_i e_i - Σ_{k<i} L[i,k] X[k, :]   (for i >= 1)
-    // where L[i, k] = β_i (k_i·k_k) exp(gc[i-1] - gc[k]) for k<i.
+    // L is now precomputed; inner loop is pure mul-add.
     for (int i = 1; i < S; ++i) {
         if (j < i) {
-            const float beta_i = beta_t[i];
-            const float g_im1  = g_t[i - 1];           // gc[i-1]; gc[-1] handled by i>=1
             float sum = 0.0f;
             for (int k = j; k < i; ++k) {
-                const float L_ik = beta_i * KK_dot[i * S + k] * __expf(g_im1 - g_t[k]);
-                sum += L_ik * X[k * S + j];
+                sum += KK_dot[i * S + k] * X[k * S + j];
             }
             X[i * S + j] = -sum;     // (I + L) form: X[i, :] = -L · X[<i, :]
         }
@@ -294,9 +299,10 @@ __global__ void gdn_chunk_prepare_h_kernel(
     const int num_chunks = (T + S - 1) / S;
 
     const int tid     = threadIdx.x;
-    const int warp_id = tid >> 5;        // 0..3
+    const int warp_id = tid >> 5;        // 0..7 (8 warps)
     const int lane    = tid & 31;
     (void) lane;
+    constexpr int NWARPS = 8;
 
     extern __shared__ __align__(16) char gdn_ph_smem[];
     __nv_bfloat16 * K_tile  = reinterpret_cast<__nv_bfloat16 *>(gdn_ph_smem);                    // 16 KB
@@ -308,7 +314,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
 
     // ── Initialise h_smem from h_initial or zeros.
     #pragma unroll 4
-    for (int idx = tid; idx < DK * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < DK * DV_BLK; idx += 256) {
         const int dk    = idx / DV_BLK;
         const int dv_lc = idx % DV_BLK;
         if (h_initial != nullptr) {
@@ -326,7 +332,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
 
         // -- Save h_smem to h_per_chunk[c] (state at the START of chunk c).
         #pragma unroll 4
-        for (int idx = tid; idx < DK * DV_BLK; idx += 128) {
+        for (int idx = tid; idx < DK * DV_BLK; idx += 256) {
             const int dk    = idx / DV_BLK;
             const int dv_lc = idx % DV_BLK;
             const int hpc_off = (((b_idx * num_chunks + c) * H + h_idx) * DK + dk) * DV
@@ -336,7 +342,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
 
         // -- Cooperative load K, V, A_sol, gc tiles for this chunk.
         #pragma unroll 4
-        for (int idx = tid; idx < S * DK; idx += 128) {
+        for (int idx = tid; idx < S * DK; idx += 256) {
             const int t_local = idx / DK;
             const int dk      = idx % DK;
             const int t_g     = t_chunk_start + t_local;
@@ -344,7 +350,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
                           ? K[((b_idx * T + t_g) * H + h_idx) * DK + dk]
                           : __float2bfloat16(0.0f);
         }
-        for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        for (int idx = tid; idx < S * DV_BLK; idx += 256) {
             const int t_local = idx / DV_BLK;
             const int dv_lc   = idx % DV_BLK;
             const int t_g     = t_chunk_start + t_local;
@@ -352,7 +358,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
                           ? V[((b_idx * T + t_g) * H + h_idx) * DV + (dv_off + dv_lc)]
                           : __float2bfloat16(0.0f);
         }
-        for (int idx = tid; idx < S * S; idx += 128) {
+        for (int idx = tid; idx < S * S; idx += 256) {
             const int i = idx / S;
             const int j = idx % S;
             const int t_g = t_chunk_start + i;
@@ -360,7 +366,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
                           ? A_sol[((b_idx * T + t_g) * H + h_idx) * S + j]
                           : __float2bfloat16(0.0f);
         }
-        for (int t_local = tid; t_local < S; t_local += 128) {
+        for (int t_local = tid; t_local < S; t_local += 256) {
             const int t_g = t_chunk_start + t_local;
             gc_tile[t_local] = (t_g < T) ? g_cumsum[(b_idx * T + t_g) * H + h_idx] : 0.0f;
         }
@@ -368,34 +374,36 @@ __global__ void gdn_chunk_prepare_h_kernel(
 
         // ──────────────────────────────────────────────────────────────
         // STEP-V: V_eff = V - K @ h_smem    [S, DV_BLK]
+        // 8 warps × 2 tiles each. Layout: warp w → row strip (w%4)*16, cols [(w/4)*32, (w/4)*32+32)
         // ──────────────────────────────────────────────────────────────
         {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
             #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) wmma::fill_fragment(acc[cc], 0.0f);
+            for (int cc = 0; cc < 2; ++cc) wmma::fill_fragment(acc[cc], 0.0f);
 
-            const int row_off = warp_id * WMMA_M;
+            const int row_off = (warp_id & 3) * WMMA_M;
+            const int col_base = (warp_id >> 2) * 32;
             #pragma unroll
             for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
                 wmma::load_matrix_sync(a_frag, K_tile + row_off * DK + dk_block, DK);
                 #pragma unroll
-                for (int cc = 0; cc < 4; ++cc) {
-                    wmma::load_matrix_sync(b_frag, h_smem + dk_block * DV_BLK + cc * WMMA_N, DV_BLK);
+                for (int cc = 0; cc < 2; ++cc) {
+                    wmma::load_matrix_sync(b_frag, h_smem + dk_block * DV_BLK + col_base + cc * WMMA_N, DV_BLK);
                     wmma::mma_sync(acc[cc], a_frag, b_frag, acc[cc]);
                 }
             }
             #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) {
-                wmma::store_matrix_sync(scratch + row_off * DV_BLK + cc * WMMA_N, acc[cc],
+            for (int cc = 0; cc < 2; ++cc) {
+                wmma::store_matrix_sync(scratch + row_off * DV_BLK + col_base + cc * WMMA_N, acc[cc],
                                          DV_BLK, wmma::mem_row_major);
             }
         }
         __syncthreads();
 
         // V_tile bf16 ← V - exp(gc[t-1]) · scratch.   (gc[-1]:=0)
-        for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        for (int idx = tid; idx < S * DV_BLK; idx += 256) {
             const int t       = idx / DV_BLK;
             const float gc_im1 = (t > 0) ? gc_tile[t - 1] : 0.0f;
             const float decay  = __expf(gc_im1);
@@ -406,27 +414,29 @@ __global__ void gdn_chunk_prepare_h_kernel(
 
         // ──────────────────────────────────────────────────────────────
         // STEP-U: U = A_sol @ V_eff    [S, DV_BLK]
+        // 8 warps × 2 col tiles each (same layout as STEP-V).
         // ──────────────────────────────────────────────────────────────
         {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
             #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) wmma::fill_fragment(acc[cc], 0.0f);
+            for (int cc = 0; cc < 2; ++cc) wmma::fill_fragment(acc[cc], 0.0f);
 
-            const int row_off = warp_id * WMMA_M;
+            const int row_off  = (warp_id & 3) * WMMA_M;
+            const int col_base = (warp_id >> 2) * 32;
             #pragma unroll
             for (int kb = 0; kb < S; kb += WMMA_K) {
                 wmma::load_matrix_sync(a_frag, A_tile + row_off * S + kb, S);
                 #pragma unroll
-                for (int cc = 0; cc < 4; ++cc) {
-                    wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + cc * WMMA_N, DV_BLK);
+                for (int cc = 0; cc < 2; ++cc) {
+                    wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + col_base + cc * WMMA_N, DV_BLK);
                     wmma::mma_sync(acc[cc], a_frag, b_frag, acc[cc]);
                 }
             }
             #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) {
-                wmma::store_matrix_sync(scratch + row_off * DV_BLK + cc * WMMA_N, acc[cc],
+            for (int cc = 0; cc < 2; ++cc) {
+                wmma::store_matrix_sync(scratch + row_off * DV_BLK + col_base + cc * WMMA_N, acc[cc],
                                          DV_BLK, wmma::mem_row_major);
             }
         }
@@ -434,7 +444,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
 
         // V_tile bf16 ← W[t,d] = exp(gc[S-1] - gc[t]) · U[t,d].
         const float gc_total = gc_tile[S - 1];
-        for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+        for (int idx = tid; idx < S * DV_BLK; idx += 256) {
             const int t = idx / DV_BLK;
             const float decay = __expf(gc_total - gc_tile[t]);
             V_tile[idx] = __float2bfloat16(decay * scratch[idx]);
@@ -456,62 +466,35 @@ __global__ void gdn_chunk_prepare_h_kernel(
         // ──────────────────────────────────────────────────────────────
         const float gc_decay = __expf(gc_total);
         {
-            // K^T row tile: load K_tile as fragment_a col_major (logical K^T view).
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;  // W tile
+            // K^T @ W with output [DK=128, DV_BLK=64] = 8x4 = 32 tiles.
+            // 8 warps × 4 col tiles each (1 row strip per warp; warp w → DK rows [w*16, +16)).
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
-
-            // Each warp does 2 row strips × 4 col tiles = 8 wmma per chunk.
             #pragma unroll
-            for (int strip = 0; strip < 2; ++strip) {
-                const int dk_off = warp_id * WMMA_M + strip * 64;   // [0,64) or [64,128)
+            for (int cc = 0; cc < 4; ++cc) wmma::fill_fragment(acc[cc], 0.0f);
 
-                #pragma unroll
-                for (int cc = 0; cc < 4; ++cc) wmma::fill_fragment(acc[cc], 0.0f);
-
-                // Inner: sum over S in steps of 16. K^T[dk_off:+16, kb:+16] is
-                // K[kb:+16, dk_off:+16] in original layout. Loaded as wmma
-                // matrix_a row_major with stride DK (= 128) makes each row of
-                // a_frag = K[kb+row, dk_off+col]... that's matrix K NOT K^T.
-                //
-                // We want a_frag[m, k_idx] = K^T[m, k_idx] = K[k_idx, m]
-                //   where m is the dk_off row, k_idx is the inner S step.
-                //
-                // Trick: use fragment_a col_major. With ldm=DK, base address
-                // K_tile + kb * DK + dk_off, the fragment loads:
-                //   a_frag[m, k] = K_tile[(kb + k) * DK + (dk_off + m)]
-                //                = K[k_idx_global=kb+k, dk=dk_off+m]
-                //                = K^T[m, k_idx]  ✓
-                //
-                // Note: nvcuda::wmma::matrix_a with col_major IS supported for
-                // bf16 on sm_80+.
-                #pragma unroll
-                for (int kb = 0; kb < S; kb += WMMA_K) {
-                    // We need K^T[dk_off:+16, kb:+16] as fragment_a.
-                    // Load K_tile col_major view.
-                    {
-                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a_col;
-                        wmma::load_matrix_sync(a_col, K_tile + kb * DK + dk_off, DK);
-                        #pragma unroll
-                        for (int cc = 0; cc < 4; ++cc) {
-                            wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + cc * WMMA_N, DV_BLK);
-                            wmma::mma_sync(acc[cc], a_col, b_frag, acc[cc]);
-                        }
-                    }
-                }
-
-                // Store K^T @ W into scratch[dk_off:+16, :].
+            const int dk_off = warp_id * WMMA_M;     // [0, 16, 32, ..., 112]
+            #pragma unroll
+            for (int kb = 0; kb < S; kb += WMMA_K) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a_col;
+                wmma::load_matrix_sync(a_col, K_tile + kb * DK + dk_off, DK);
                 #pragma unroll
                 for (int cc = 0; cc < 4; ++cc) {
-                    wmma::store_matrix_sync(scratch + dk_off * DV_BLK + cc * WMMA_N,
-                                             acc[cc], DV_BLK, wmma::mem_row_major);
+                    wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + cc * WMMA_N, DV_BLK);
+                    wmma::mma_sync(acc[cc], a_col, b_frag, acc[cc]);
                 }
-            }   // end strip loop
+            }
+            #pragma unroll
+            for (int cc = 0; cc < 4; ++cc) {
+                wmma::store_matrix_sync(scratch + dk_off * DV_BLK + cc * WMMA_N,
+                                         acc[cc], DV_BLK, wmma::mem_row_major);
+            }
         }
         __syncthreads();
 
         // h_smem ← gc_decay · h_smem + scratch  (full DK rows × DV_BLK cols).
         #pragma unroll 4
-        for (int idx = tid; idx < DK * DV_BLK; idx += 128) {
+        for (int idx = tid; idx < DK * DV_BLK; idx += 256) {
             const float upd = gc_decay * __bfloat162float(h_smem[idx]) + scratch[idx];
             h_smem[idx] = __float2bfloat16(upd);
         }
@@ -521,7 +504,7 @@ __global__ void gdn_chunk_prepare_h_kernel(
     // ── Write h_final.
     if (h_final != nullptr) {
         #pragma unroll 4
-        for (int idx = tid; idx < DK * DV_BLK; idx += 128) {
+        for (int idx = tid; idx < DK * DV_BLK; idx += 256) {
             const int dk    = idx / DV_BLK;
             const int dv_lc = idx % DV_BLK;
             const int hf_off = ((b_idx * H + h_idx) * DK + dk) * DV + (dv_off + dv_lc);
@@ -560,7 +543,7 @@ inline void launch_gdn_chunk_prepare_h(
 
     const int num_dv_blocks = DV / DV_BLK;
     dim3 grid(num_dv_blocks, H, B);
-    dim3 block(128);
+    dim3 block(256);   // 8 warps for prepare_h wmma
     kernel_ptr<<<grid, block, SMEM_TOTAL, stream>>>(
         K, V, g_cumsum, A_sol, h_initial, h_per_chunk, h_final,
         B, T, H, DV, /*dv_blk_off=*/0);
@@ -637,8 +620,8 @@ __global__ void gdn_chunk_fused_fwd_kernel(
     const int num_chunks = (T + S - 1) / S;
     const int t_chunk_start = chunk_idx * S;
 
-    const int tid     = threadIdx.x;     // 0..127
-    const int warp_id = tid >> 5;        // 0..3
+    const int tid     = threadIdx.x;     // 0..255
+    const int warp_id = tid >> 5;        // 0..7 (8 warps)
     const int lane    = tid & 31;
     (void) lane;
 
@@ -654,7 +637,7 @@ __global__ void gdn_chunk_fused_fwd_kernel(
     // ── Cooperative load of all tiles for this chunk (128 threads).
     // Q, K [S, DK]: 8192 bf16 each → 64 per thread.
     #pragma unroll 4
-    for (int idx = tid; idx < S * DK; idx += 128) {
+    for (int idx = tid; idx < S * DK; idx += 256) {
         const int t_local = idx / DK;
         const int dk      = idx % DK;
         const int t_g     = t_chunk_start + t_local;
@@ -664,7 +647,7 @@ __global__ void gdn_chunk_fused_fwd_kernel(
         K_tile[t_local * DK + dk] = ok ? K[off] : __float2bfloat16(0.0f);
     }
     // V [S, DV_BLK]: 4096 bf16 → 32 per thread.
-    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < S * DV_BLK; idx += 256) {
         const int t_local = idx / DV_BLK;
         const int dv_lc   = idx % DV_BLK;
         const int t_g     = t_chunk_start + t_local;
@@ -674,7 +657,7 @@ __global__ void gdn_chunk_fused_fwd_kernel(
         V_tile[t_local * DV_BLK + dv_lc] = v;
     }
     // A_sol [S, S].
-    for (int idx = tid; idx < S * S; idx += 128) {
+    for (int idx = tid; idx < S * S; idx += 256) {
         const int i = idx / S;
         const int j = idx % S;
         const int t_g = t_chunk_start + i;
@@ -688,7 +671,7 @@ __global__ void gdn_chunk_fused_fwd_kernel(
     }
     // h_tile [DK, DV_BLK]: 8192 bf16 → 64 per thread.
     #pragma unroll 4
-    for (int idx = tid; idx < DK * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < DK * DV_BLK; idx += 256) {
         const int dk    = idx / DV_BLK;
         const int dv_lc = idx % DV_BLK;
         const int hpc_off = (((b_idx * num_chunks + chunk_idx) * H + h_idx) * DK + dk) * DV
@@ -699,35 +682,36 @@ __global__ void gdn_chunk_fused_fwd_kernel(
 
     // ───────────────────────────────────────────────────────────────────────
     // STEP-V: V_eff = V - K @ h    [S, DV_BLK] = [S, DK] @ [DK, DV_BLK]
-    // Each warp does row-tile [warp_id*16, +15]. 4 col tiles × 8 inner steps each.
+    // 8 warps × 2 col tiles each. warp w → row strip (w%4)*16, col [(w/4)*32, +32).
     // ───────────────────────────────────────────────────────────────────────
     {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
         #pragma unroll
-        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+        for (int c = 0; c < 2; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-        const int row_off = warp_id * WMMA_M;
+        const int row_off  = (warp_id & 3) * WMMA_M;
+        const int col_base = (warp_id >> 2) * 32;
         #pragma unroll
         for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
             wmma::load_matrix_sync(a_frag, K_tile + row_off * DK + dk_block, DK);
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                wmma::load_matrix_sync(b_frag, h_tile + dk_block * DV_BLK + c * WMMA_N, DV_BLK);
+            for (int c = 0; c < 2; ++c) {
+                wmma::load_matrix_sync(b_frag, h_tile + dk_block * DV_BLK + col_base + c * WMMA_N, DV_BLK);
                 wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
             }
         }
         #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+        for (int c = 0; c < 2; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + col_base + c * WMMA_N, acc[c],
                                      DV_BLK, wmma::mem_row_major);
         }
     }
     __syncthreads();
 
     // V_tile bf16 ← V - exp(gc[t-1]) · scratch. (gc[-1] := 0, i.e., t=0 has factor 1.)
-    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < S * DV_BLK; idx += 256) {
         const int t      = idx / DV_BLK;
         const float gc_im1 = (t > 0) ? gc_tile[t - 1] : 0.0f;
         const float decay  = __expf(gc_im1);
@@ -738,27 +722,29 @@ __global__ void gdn_chunk_fused_fwd_kernel(
 
     // ───────────────────────────────────────────────────────────────────────
     // STEP-U: U = A_sol @ V_eff    [S, DV_BLK] = [S, S] @ [S, DV_BLK]
+    // 8 warps × 2 col tiles each.
     // ───────────────────────────────────────────────────────────────────────
     {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
         #pragma unroll
-        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+        for (int c = 0; c < 2; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-        const int row_off = warp_id * WMMA_M;
+        const int row_off  = (warp_id & 3) * WMMA_M;
+        const int col_base = (warp_id >> 2) * 32;
         #pragma unroll
         for (int kb = 0; kb < S; kb += WMMA_K) {
             wmma::load_matrix_sync(a_frag, A_tile + row_off * S + kb, S);
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + c * WMMA_N, DV_BLK);
+            for (int c = 0; c < 2; ++c) {
+                wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + col_base + c * WMMA_N, DV_BLK);
                 wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
             }
         }
         #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+        for (int c = 0; c < 2; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + col_base + c * WMMA_N, acc[c],
                                      DV_BLK, wmma::mem_row_major);
         }
     }
@@ -766,7 +752,7 @@ __global__ void gdn_chunk_fused_fwd_kernel(
 
     // V_tile bf16 ← U_fp32 cast. (V_tile now holds U_bf16, ready for the
     // attn @ U matmul below.)
-    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < S * DV_BLK; idx += 256) {
         V_tile[idx] = __float2bfloat16(scratch[idx]);
     }
     __syncthreads();
@@ -774,30 +760,32 @@ __global__ void gdn_chunk_fused_fwd_kernel(
     // ───────────────────────────────────────────────────────────────────────
     // STEP-QK: QK = Q @ K^T    [S, S] = [S, DK] @ [DK, S]
     // K^T is achieved via fragment_b col_major (logical view of K_tile).
+    // 8 warps × 2 col tiles each.
     // ───────────────────────────────────────────────────────────────────────
     {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
         #pragma unroll
-        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+        for (int c = 0; c < 2; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-        const int row_off = warp_id * WMMA_M;
+        const int row_off  = (warp_id & 3) * WMMA_M;
+        const int col_base = (warp_id >> 2) * 32;
         #pragma unroll
         for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
             wmma::load_matrix_sync(a_frag, Q_tile + row_off * DK + dk_block, DK);
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                // Load K viewed as [DK, S] col_major. Tile starting at logical
-                // (dk_block, c*16): base = K_tile + (c*16)*DK + dk_block, ldm=DK.
+            for (int c = 0; c < 2; ++c) {
+                // K viewed as [DK, S] col_major. Tile (dk_block, col_base+c*16):
+                // base = K_tile + (col_base+c*16)*DK + dk_block, ldm=DK.
                 wmma::load_matrix_sync(b_frag,
-                    K_tile + (c * WMMA_N) * DK + dk_block, DK);
+                    K_tile + (col_base + c * WMMA_N) * DK + dk_block, DK);
                 wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
             }
         }
         #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            wmma::store_matrix_sync(scratch + row_off * S + c * WMMA_N, acc[c],
+        for (int c = 0; c < 2; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * S + col_base + c * WMMA_N, acc[c],
                                      S, wmma::mem_row_major);
         }
     }
@@ -805,7 +793,7 @@ __global__ void gdn_chunk_fused_fwd_kernel(
 
     // attn[t, k] = scratch[t, k] · exp(gc[t] - gc[k])  for k ≤ t  else 0.
     // Cast to bf16 in A_tile (was the A_sol storage; A_sol is no longer needed).
-    for (int idx = tid; idx < S * S; idx += 128) {
+    for (int idx = tid; idx < S * S; idx += 256) {
         const int t = idx / S;
         const int k = idx % S;
         float v = 0.0f;
@@ -818,68 +806,72 @@ __global__ void gdn_chunk_fused_fwd_kernel(
 
     // ───────────────────────────────────────────────────────────────────────
     // STEP-O_intra: O_intra = attn @ U   [S, DV_BLK] = [S, S] @ [S, DV_BLK]
+    // 8 warps × 2 col tiles each.
     // ───────────────────────────────────────────────────────────────────────
     {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
         #pragma unroll
-        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+        for (int c = 0; c < 2; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-        const int row_off = warp_id * WMMA_M;
+        const int row_off  = (warp_id & 3) * WMMA_M;
+        const int col_base = (warp_id >> 2) * 32;
         #pragma unroll
         for (int kb = 0; kb < S; kb += WMMA_K) {
             wmma::load_matrix_sync(a_frag, A_tile + row_off * S + kb, S);
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + c * WMMA_N, DV_BLK);
+            for (int c = 0; c < 2; ++c) {
+                wmma::load_matrix_sync(b_frag, V_tile + kb * DV_BLK + col_base + c * WMMA_N, DV_BLK);
                 wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
             }
         }
         #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+        for (int c = 0; c < 2; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + col_base + c * WMMA_N, acc[c],
                                      DV_BLK, wmma::mem_row_major);
         }
     }
     __syncthreads();
 
     // V_tile bf16 ← O_intra_fp32 cast. (V_tile becomes O_intra_bf16 stash.)
-    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < S * DV_BLK; idx += 256) {
         V_tile[idx] = __float2bfloat16(scratch[idx]);
     }
     __syncthreads();
 
     // ───────────────────────────────────────────────────────────────────────
     // STEP-Qh: Qh = Q @ h_tile    [S, DV_BLK] = [S, DK] @ [DK, DV_BLK]
+    // 8 warps × 2 col tiles each.
     // ───────────────────────────────────────────────────────────────────────
     {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
         #pragma unroll
-        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+        for (int c = 0; c < 2; ++c) wmma::fill_fragment(acc[c], 0.0f);
 
-        const int row_off = warp_id * WMMA_M;
+        const int row_off  = (warp_id & 3) * WMMA_M;
+        const int col_base = (warp_id >> 2) * 32;
         #pragma unroll
         for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
             wmma::load_matrix_sync(a_frag, Q_tile + row_off * DK + dk_block, DK);
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                wmma::load_matrix_sync(b_frag, h_tile + dk_block * DV_BLK + c * WMMA_N, DV_BLK);
+            for (int c = 0; c < 2; ++c) {
+                wmma::load_matrix_sync(b_frag, h_tile + dk_block * DV_BLK + col_base + c * WMMA_N, DV_BLK);
                 wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
             }
         }
         #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            wmma::store_matrix_sync(scratch + row_off * DV_BLK + c * WMMA_N, acc[c],
+        for (int c = 0; c < 2; ++c) {
+            wmma::store_matrix_sync(scratch + row_off * DV_BLK + col_base + c * WMMA_N, acc[c],
                                      DV_BLK, wmma::mem_row_major);
         }
     }
     __syncthreads();
 
     // ── FINAL: O[t, dv] = bf2f(V_tile[t,dv]) + exp(gc[t]) · scratch[t,dv]
-    for (int idx = tid; idx < S * DV_BLK; idx += 128) {
+    for (int idx = tid; idx < S * DV_BLK; idx += 256) {
         const int t     = idx / DV_BLK;
         const int dv_lc = idx % DV_BLK;
         const int t_g   = t_chunk_start + t;
@@ -927,7 +919,7 @@ inline void launch_gdn_chunk_fused_fwd(
     const int num_chunks    = (T + S - 1) / S;
     const int num_dv_blocks = DV / DV_BLK;
     dim3 grid(num_chunks * num_dv_blocks, H, B);
-    dim3 block(128);    // 4 warps for wmma
+    dim3 block(256);    // 8 warps for wmma
     kernel_ptr<<<grid, block, SMEM_TOTAL, stream>>>(
         Q, K, V, A_sol, g_cumsum, h_per_chunk, O, B, T, H, DV, num_dv_blocks);
 }
