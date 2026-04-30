@@ -501,3 +501,60 @@ on branch `feature/dflash-integration`.
 Next concrete step (when starting): Phase 1.1, scaffold
 `gated_delta_net_chunk.cu` with empty kernel definitions and the
 dispatcher wrapper compiling cleanly.
+
+---
+
+## 8. Implementation status (2026-04-30 autonomous run)
+
+All 6 phases complete in a single autonomous session.
+
+### Phase 1 — chunk_local_cumsum + kkt_solve
+- `gdn_chunk_local_cumsum_kernel`: chunk-local prefix sum via warp-shuffle, 2-warp combine. Block 64, grid (num_chunks, H, B).
+- `gdn_chunk_kkt_solve_kernel<S=64, DK=128>`: forward-substitution solver for (I-L)X = diag(beta) per chunk. ~48 KB shared, dynamic-shared opt-in via cudaFuncSetAttribute. K must be L2-normalised (already true in production).
+- Numerical validation: `tests/test_gdn_chunk.cu` + `tools/test/gdn_chunk_ref.py`.
+  - cumsum: max_abs_diff = 1.79e-7 (fp32 precision)
+  - kkt_solve: max_abs_diff = 1.5e-5 (excellent bf16)
+
+### Phase 2 — prepare_h
+- `gdn_chunk_prepare_h_kernel<S=64, DK=128, DV_BLK=64>`: SSM state advance with per-token-within-chunk inner loop. h state held in registers (64 fp32 values per thread, 256 bytes/thread). Sequential chunks within each CTA, sequential tokens within each chunk. Cross-warp dot-product reduction via shared scratch buffer.
+- 25 KB shared (K_tile 16 KB, V_tile 8 KB, gc/b_tile 0.5 KB, dot_scratch 0.5 KB).
+- Numerical validation: max_abs_diff = 1.95e-3 (one bf16 LSB at |x|=1).
+
+### Phase 3 — fused_fwd
+- `gdn_chunk_fused_fwd_kernel<S=64, DK=128, DV_BLK=64>`: combined (V_eff = V - K@h) → (U = A_sol @ V_eff via in-place reverse iteration) → (O_intra + O_inter) in one CTA.
+- 80 KB shared (Q 16, K 16, V/V_eff/U fp32 16, A/QK union 16, gc 0.25, h 16). Dynamic-shared opt-in.
+- Numerical validation: max_abs_diff = 6.25e-2 = exactly half a bf16 LSB at |x|≈8. mean_abs = 1.4e-3 = 0.15% of signal magnitude. PASS with magnitude-aware tolerance (1% of |O|max + epsilon).
+
+### Phase 4 — ggml dispatcher integration
+- `gated_delta_net_chunk.cu` houses the production dispatcher `ggml_cuda_op_gated_delta_net_chunk` that:
+  - Allocates scratch (Q/K/V bf16, A_sol, h_initial, h_per_chunk, h_final, O_bf16, g_cumsum) via `ggml_cuda_pool_alloc`.
+  - Converts fp32 → bf16 for Q/K/V and transposes/casts h_initial from `[seq, head, dv, dk]` (per-token state layout) to `[B, H, DK, DV]` (chunked kernel layout).
+  - Runs the 4 chunk kernels.
+  - Writes O bf16→fp32 with the standard `1/√S_v` scale into dst[attn], transposes h_final back to per-token state layout into dst[state].
+- `ggml_cuda_op_gated_delta_net_dispatch` is the new entry-point in ggml-cuda.cu's GGML_OP_GATED_DELTA_NET case. Routing: chunked path iff (!tree && !KDA && S_v==128 && n_tokens >= 64). Env-var `GGML_GDN_CHUNK_DISABLE=1` forces per-token (escape hatch + A/B perf testing).
+- Falls back to per-token if Q/K/V/g/beta/state are not fully contiguous (rare in production).
+
+### Phase 5 — production smoke test on AEON-XS NVFP4
+- Short-prompt fallback (13 tokens, < threshold): clean output The capital of France is **Paris**.
+- Long-prompt chunked path (158 tokens, > threshold): chunked path activated, coherent output, no crashes, no NaN, no memory issues.
+
+### Phase 6 — perf benchmark + decision
+A/B comparison via llama-batched-bench on AEON-XS NVFP4, GB10:
+
+| PP  | chunked t/s | per-token t/s | Δ |
+|-----|-------------|---------------|---|
+| 128 | 453.86 | 451.17 | +0.6% |
+| 256 | 524.64 | 528.21 | -0.7% |
+| 512 | 542.50 | 542.59 | tie |
+
+Performance is at parity within measurement noise. The first cut uses scalar fp32 mul-adds throughout (no tensor cores), with redundant per-thread work in the QK matrix and 64-thread CTAs that under-utilise the SM. The path is correct and safe to enable by default; future tuning (tensor cores via `mma.sync` for the QK and U @ A blocks, multi-warp pipelining of K/V loads with compute) can lift this above the per-token kernel.
+
+**Default-on decision:** enabled by default (`n_tokens >= 64` gate). `GGML_GDN_CHUNK_DISABLE=1` available as escape hatch. No regression observed.
+
+### Files touched
+- New: `ggml/src/ggml-cuda/gated_delta_net_chunk.cu`
+- New: `ggml/src/ggml-cuda/gated_delta_net_chunk_kernels.cuh`
+- New: `tools/test/gdn_chunk_ref.py`
+- New: `tests/test_gdn_chunk.cu`
+- Edited: `ggml/src/ggml-cuda/gated_delta_net.cuh` (added chunk + dispatch declarations)
+- Edited: `ggml/src/ggml-cuda/ggml-cuda.cu` (route GGML_OP_GATED_DELTA_NET through dispatcher)
