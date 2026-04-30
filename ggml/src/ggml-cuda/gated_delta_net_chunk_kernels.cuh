@@ -97,14 +97,17 @@ __global__ void gdn_chunk_kkt_solve_kernel(
     int B, int T, int H) {
 
     constexpr int S = CHUNK_SIZE;
+    namespace wmma = nvcuda::wmma;
+    constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
 
     const int chunk_idx = blockIdx.x;
     const int h         = blockIdx.y;
     const int b         = blockIdx.z;
-    const int j         = threadIdx.x;        // column index (one per thread)
 
-    const int t_for_thread = chunk_idx * S + j;
-    const bool in_range    = (j < S) && (t_for_thread < T);
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;        // 0..3
+    const int lane    = tid & 31;
+    (void) lane;
 
     extern __shared__ __align__(16) char gdn_smem_raw[];
     __nv_bfloat16 * K_tile  = reinterpret_cast<__nv_bfloat16 *>(gdn_smem_raw);          // [S, DK]
@@ -113,45 +116,65 @@ __global__ void gdn_chunk_kkt_solve_kernel(
     float         * beta_t  = X + S * S;                                                  // [S]
     float         * g_t     = beta_t + S;                                                 // [S]
 
-    // Cooperative load: each thread loads its row of K, plus its scalars.
-    const int K_row_off = ((b * T + t_for_thread) * H + h) * DK;
-    if (in_range) {
-        #pragma unroll 8
-        for (int d = 0; d < DK; ++d) {
-            K_tile[j * DK + d] = K[K_row_off + d];
-        }
-        const int scalar_off = (b * T + t_for_thread) * H + h;
-        beta_t[j] = beta[scalar_off];
-        g_t[j]    = g_cumsum[scalar_off];
-    } else {
-        #pragma unroll 8
-        for (int d = 0; d < DK; ++d) {
-            K_tile[j * DK + d] = __float2bfloat16(0.0f);
-        }
-        beta_t[j] = 0.0f;
-        g_t[j]    = 0.0f;
+    // Cooperative load with 128 threads (was 64).
+    // K [S, DK] = 8192 bf16 elements → 64 per thread.
+    #pragma unroll 4
+    for (int idx = tid; idx < S * DK; idx += 128) {
+        const int t_local = idx / DK;
+        const int dk      = idx % DK;
+        const int t_g     = chunk_idx * S + t_local;
+        K_tile[idx] = (t_g < T)
+                      ? K[((b * T + t_g) * H + h) * DK + dk]
+                      : __float2bfloat16(0.0f);
+    }
+    for (int t_local = tid; t_local < S; t_local += 128) {
+        const int t_g = chunk_idx * S + t_local;
+        beta_t[t_local] = (t_g < T) ? beta[(b * T + t_g) * H + h] : 0.0f;
+        g_t[t_local]    = (t_g < T) ? g_cumsum[(b * T + t_g) * H + h] : 0.0f;
     }
     __syncthreads();
 
-    // KK_dot[j, k] = <K[j], K[k]> for all k ∈ [0, S).
-    #pragma unroll 4
-    for (int k = 0; k < S; ++k) {
-        float dot = 0.0f;
-        #pragma unroll 16
-        for (int d = 0; d < DK; ++d) {
-            dot += __bfloat162float(K_tile[j * DK + d]) *
-                   __bfloat162float(K_tile[k * DK + d]);
+    // ── KK_dot = K @ K^T   [S, S] = [S, DK] @ [DK, S]   (via wmma)
+    // K^T loaded as fragment_b col_major (logical view of K_tile row-major).
+    // Each warp owns one row strip of S=64 → 4 col tiles.
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) wmma::fill_fragment(acc[c], 0.0f);
+
+        const int row_off = warp_id * WMMA_M;
+        #pragma unroll
+        for (int dk_block = 0; dk_block < DK; dk_block += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, K_tile + row_off * DK + dk_block, DK);
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                wmma::load_matrix_sync(b_frag, K_tile + (c * WMMA_N) * DK + dk_block, DK);
+                wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
+            }
         }
-        KK_dot[j * S + k] = dot;
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            wmma::store_matrix_sync(KK_dot + row_off * S + c * WMMA_N, acc[c],
+                                     S, wmma::mem_row_major);
+        }
     }
     __syncthreads();
 
-    // Initialise X = diag(beta).
-    #pragma unroll 4
-    for (int row = 0; row < S; ++row) {
-        X[row * S + j] = (row == j) ? beta_t[row] : 0.0f;
+    // Initialise X = diag(beta) (cooperatively across 128 threads).
+    for (int idx = tid; idx < S * S; idx += 128) {
+        const int row = idx / S;
+        const int col = idx % S;
+        X[idx] = (row == col) ? beta_t[row] : 0.0f;
     }
     __syncthreads();
+
+    // Map thread-id 0..63 to "column j" for the (per-column) forward sub.
+    // tid 64..127 sit idle during the solve.
+    const int j = tid;
+    const int t_for_thread = chunk_idx * S + j;
+    const bool in_range = (j < S) && (t_for_thread < T);
 
     // Forward substitution: solve (I + L) X = diag(β) row by row.
     //   X[0, j] = β_0 δ_{0,j}  (already from init)
@@ -207,7 +230,7 @@ inline void launch_gdn_chunk_kkt_solve(
 
     const int num_chunks = (T + CHUNK_SIZE - 1) / CHUNK_SIZE;
     dim3 grid(num_chunks, H, B);
-    dim3 block(CHUNK_SIZE);
+    dim3 block(128);   // 4 warps for wmma KK_dot
     kernel_ptr<<<grid, block, SMEM_TOTAL, stream>>>(K, beta, g_cumsum, A_sol, B, T, H);
 }
 

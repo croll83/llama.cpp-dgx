@@ -630,3 +630,18 @@ Per-kernel breakdown after Step 3 (B=1 T=192 H=16):
 
 Production smoke test: chunked path with corrected math produces coherent output on 150-token prompt via /v1/completions. No regressions. NOTE: hermes-dark E2E re-validation needed since the corrected outputs are now bit-equivalent to per-token (whereas the buggy version had ~3% per-element drift).
 
+
+### 9.6 Step 4 — wmma kkt_solve (KK_dot phase)
+
+Replaced the scalar 64-thread KK_dot with a 4-warp wmma KK = K @ K^T (fragment_b col_major view of K_tile, accumulator fp32). Forward substitution kept scalar (64 threads × 64 sequential row updates with __syncthreads — too small for tensor cores).
+
+Block size 64 \xe2\x86\x92 128 threads. Shared budget unchanged (49 KB).
+
+| | Step 3 | Step 4 | improvement |
+|---|---|---|---|
+| kkt_solve median (us) | 117 | 63 | 1.86\xc3\x97 |
+| pipeline median (us) | 237 | 183 | 1.30\xc3\x97 |
+| Cumulative speedup vs baseline | 6.49\xc3\x97 | **8.4\xc3\x97** | — |
+
+All three big kernels now balanced: kkt_solve 34%, prepare_h 34%, fused_fwd 31%. cumsum negligible (1.4%).
+
