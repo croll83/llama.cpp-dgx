@@ -828,9 +828,17 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
+            // n_cache_reuse: NOT zeroed globally — upstream PR #17858 (Dec
+            // 2025, integrated via re-merge) made `can_cache_reuse` a
+            // per-request decision (process_slot:
+            //   can_cache_reuse = ... && !slot.prompt.tokens.has_mtmd
+            // ). Text-only requests still benefit from prefix-match reuse
+            // (system-prompt cache hits on hermes-style agents); multimodal
+            // requests skip it automatically. The vestigial global zeroing
+            // here would otherwise neutralise the per-task default and
+            // require every client JSON to set `n_cache_reuse: N` explicitly.
             if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+                SRV_INF("%s\n", "cache_reuse will apply to text-only requests; multimodal requests skip it per-request");
             }
 
             if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
@@ -844,11 +852,12 @@ private:
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
             }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
-            }
+            // n_cache_reuse: NOT zeroed — same per-request gating as above
+            // (process_slot already gates on llama_memory_can_shift). Leaving
+            // n_cache_reuse non-zero here means clients targeting a context
+            // type that DOES support shifting (when this branch happens to
+            // be wrong) get the optimisation; the per-request check is
+            // authoritative.
         }
 
         if (llama_model_n_swa(model) == 0) {
