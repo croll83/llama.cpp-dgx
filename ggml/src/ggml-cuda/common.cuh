@@ -1141,6 +1141,22 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // Release pool memory back to the CUDA driver. Returns bytes released.
+    //
+    // Default implementation does nothing; concrete pool types should
+    // override to:
+    //   - leg pool : cudaFree all currently-cached free slots
+    //   - vmm pool : cuMemUnmap the trailing physical mapping iff
+    //                pool_used == 0 (bump allocator constraint)
+    //
+    // Callers MUST ensure no in-flight allocation is outstanding (i.e.
+    // every alloc() has been matched by a free()). The server invokes
+    // this on a true-idle boundary (all slots released, no pending tasks
+    // in the queue, N seconds of inactivity) — see
+    // ggml_backend_cuda_release_idle_pools(). Safe to call when nothing
+    // is reclaimable (returns 0).
+    virtual size_t release_idle() { return 0; }
 };
 
 template<typename T>
@@ -1476,6 +1492,26 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    // Walk every pool that has been lazily created on this context and
+    // ask it to release idle memory. Returns total bytes released across
+    // all (device, stream) pools.
+    //
+    // Caller MUST guarantee no allocation/free is in flight on this
+    // context (i.e. all compute on all streams is complete and no
+    // gallocr is mid-build). See ggml_backend_cuda_release_idle_pools()
+    // for the C-level wrapper that the server / dflash idle path uses.
+    size_t release_idle_pools() {
+        size_t released = 0;
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (pools[d][s]) {
+                    released += pools[d][s]->release_idle();
+                }
+            }
+        }
+        return released;
     }
 };
 

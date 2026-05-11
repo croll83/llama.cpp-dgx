@@ -533,6 +533,26 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
+
+    // Release all cached free buffers back to the CUDA driver. Safe to
+    // call from a true-idle boundary: any buffer still allocated to a
+    // caller is not in buffer_pool (free() hasn't been invoked for it
+    // yet), so it survives this sweep untouched.
+    size_t release_idle() override {
+        size_t released = 0;
+        ggml_cuda_set_device(device);
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            ggml_cuda_buffer & b = buffer_pool[i];
+            if (b.ptr != nullptr) {
+                CUDA_CHECK(cudaFree(b.ptr));
+                released  += b.size;
+                pool_size -= b.size;
+                b.ptr  = nullptr;
+                b.size = 0;
+            }
+        }
+        return released;
+    }
 };
 
 // pool with virtual memory
@@ -642,6 +662,30 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    // Release the entire physical mapping back to the driver. Bump-
+    // allocator semantics: we can only safely unmap when pool_used == 0
+    // (no live allocations holding any address in the mapped range).
+    // The virtual address reservation (`pool_addr`) is left in place so
+    // the next allocation pays only the cuMemMap cost, not the address-
+    // reserve cost.
+    size_t release_idle() override {
+        if (pool_used > 0 || pool_size == 0) {
+            return 0;
+        }
+        ggml_cuda_set_device(device);
+        size_t released = pool_size;
+#if defined(GGML_USE_HIP)
+        for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+        }
+        mappings.clear();
+#else
+        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+#endif
+        pool_size = 0;
+        return released;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -4636,6 +4680,33 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     ggml_cuda_set_device(device);
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
+}
+
+// Idle-time pool flush. Call on a TRUE idle boundary — every compute
+// kernel on the backend's streams must be complete and every gallocr
+// build must have torn down. The server invokes this from its idle
+// scheduler after slot.release() has been seen on every slot and the
+// request queue is empty for N seconds.
+//
+// Returns total bytes released back to the CUDA driver across every
+// (device, stream) pool that has been lazily created on the backend.
+size_t ggml_backend_cuda_release_idle_pools(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx == nullptr) {
+        return 0;
+    }
+    // Block until any in-flight kernels complete on every stream.
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->streams[d][s] != nullptr) {
+                CUDA_CHECK(cudaStreamSynchronize(ctx->streams[d][s]));
+            }
+        }
+    }
+    return ctx->release_idle_pools();
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {

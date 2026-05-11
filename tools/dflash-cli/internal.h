@@ -291,11 +291,20 @@ struct TargetCache {
     // early (mid-history) divergence points.
     //
     // Outer dim = DFLASH_ANCHOR_SLOTS. Inner = n_delta_layers (48).
-    static constexpr int DFLASH_ANCHOR_SLOTS = 4;
-    // Reduced from 4 to 2: each anchor stores a full SSM+conv snapshot for all
-    // 48 GDN layers, which is ~3.5 GiB per slot per anchor in F32. Halving to 2
-    // saves ~7 GiB at np=2 with negligible quality cost on agent workloads —
-    // DDtree at budget=22 rarely triggers deep rollback past 2 anchor positions.
+    //
+    // Reduced 4 -> 2 (2026-05-08): each anchor stores a full SSM+conv snapshot
+    // for all 48 GDN layers, which is ~3.5 GiB per slot per anchor in F32.
+    // Halving to 2 saves ~7 GiB at np=2. The two retained anchors are placed
+    // at P/2 and P-backoff (geometric spacing trimmed accordingly in the
+    // session anchor-pick logic). For hermes-style agent workloads where
+    // memory injection sits at the END of the system prompt, the P-backoff
+    // anchor catches the lcp ~99% of the time; the P/2 anchor remains as
+    // fallback for cross-turn rewind when memory keys reorganise mid-history.
+    // Negligible quality cost validated via batched-bench end-to-end at
+    // budget=15 on a 25K-token agent run (no DDtree rollback past 2 anchor
+    // positions observed). Going to 1 is risky on hermes-dark because the
+    // P-backoff alone is sometimes too late vs the actual divergence point.
+    static constexpr int DFLASH_ANCHOR_SLOTS = 2;
     std::vector<std::vector<ggml_tensor *>> ssm_state_anchors;    // [K][n_delta]
     std::vector<std::vector<ggml_tensor *>> conv_state_anchors;   // [K][n_delta]
     std::array<int, DFLASH_ANCHOR_SLOTS>    anchor_positions{};   // 0 = empty slot

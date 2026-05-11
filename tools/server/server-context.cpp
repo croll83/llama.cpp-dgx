@@ -19,6 +19,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -590,6 +591,14 @@ private:
     // CUDA backend handle used for DFlash weights + per-slot sessions. Owned
     // by this context for the process lifetime; freed in destroy().
     ggml_backend_t     dflash_backend = nullptr;
+
+    // Last time we flushed the CUDA pool on idle. Used to throttle
+    // ggml_backend_cuda_release_idle_pools() to at most once every
+    // POOL_FLUSH_MIN_INTERVAL seconds — otherwise the log line spam from
+    // the "all_idle" branch (printed every HTTP poll tick) would trigger
+    // a flush each second.
+    std::chrono::steady_clock::time_point last_pool_flush_at = std::chrono::steady_clock::time_point::min();
+    static constexpr int POOL_FLUSH_MIN_INTERVAL_SEC = 60;
 
     bool add_bos_token = true;
 
@@ -2244,6 +2253,34 @@ private:
             if (all_idle) {
                 SRV_INF("%s", "all slots are idle\n");
 
+                // Reclaim cached compute-scratch memory from the CUDA pool.
+                // The pool grows monotonically with shape variation (each
+                // unique request shape carves out a new buffer that the
+                // free-list never returns to the driver). On bursty
+                // workloads with many distinct prompt sizes — e.g. mem0
+                // nightly memory-extraction flush, where every transcript
+                // is a different length — this manifests as a slow VRAM
+                // leak (~360 MiB per cancel/error incident on AEON-XS).
+                // Flushing on a true-idle boundary returns those buffers
+                // to the driver; the next active request will alloc fresh
+                // ones (with cache locality benefits).
+                //
+                // Throttle to once every POOL_FLUSH_MIN_INTERVAL_SEC since
+                // this branch fires on every poll tick once slots go idle.
+                if (dflash_backend != nullptr) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - last_pool_flush_at).count();
+                    if (elapsed >= POOL_FLUSH_MIN_INTERVAL_SEC) {
+                        const size_t freed = ggml_backend_cuda_release_idle_pools(dflash_backend);
+                        if (freed > 0) {
+                            SRV_INF("released %.1f MiB of idle CUDA pool memory (dflash)\n",
+                                    (double) freed / (1024.0 * 1024.0));
+                        }
+                        last_pool_flush_at = now;
+                    }
+                }
+
                 return;
             }
         }
@@ -3259,9 +3296,32 @@ private:
         // Single-slot MVP: iterate, pick up anything STARTED, run synchronously.
         // Non-STARTED slots are either idle or already done (we transition all
         // the way to RELEASED within process_slot_dflash).
+        bool any_active = false;
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_STARTED) {
                 process_slot_dflash(slot);
+            }
+            if (slot.is_processing()) {
+                any_active = true;
+            }
+        }
+
+        // Idle-time CUDA pool flush. See the parallel block in update_slots
+        // for the rationale; this path is the one actually hit in production
+        // when dflash is enabled and the request mix is text-only (the
+        // standard update_slots' all_idle branch is skipped via the early
+        // `return` in the dispatcher above).
+        if (!any_active && dflash_backend != nullptr) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_pool_flush_at).count();
+            if (elapsed >= POOL_FLUSH_MIN_INTERVAL_SEC) {
+                const size_t freed = ggml_backend_cuda_release_idle_pools(dflash_backend);
+                if (freed > 0) {
+                    SRV_INF("released %.1f MiB of idle CUDA pool memory (dflash)\n",
+                            (double) freed / (1024.0 * 1024.0));
+                }
+                last_pool_flush_at = now;
             }
         }
     }

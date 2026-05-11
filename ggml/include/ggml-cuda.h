@@ -43,6 +43,15 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// Idle-time CUDA pool flush. Releases free buffers from the backend's
+// internal compute-scratch pool back to the driver. Returns bytes freed.
+// Caller MUST guarantee no allocation is in flight on `backend` (i.e.
+// every alloc() has been matched by a free()) — the server invokes this
+// from its idle scheduler after every slot has been seen RELEASED and
+// the queue has been idle for N seconds. Safe to call when nothing is
+// reclaimable (returns 0); cheap to call on every idle tick.
+GGML_BACKEND_API size_t ggml_backend_cuda_release_idle_pools(ggml_backend_t backend);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus
