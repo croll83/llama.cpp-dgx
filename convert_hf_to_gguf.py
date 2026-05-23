@@ -654,6 +654,15 @@ class ModelBase:
                 or "vision_model" in name
             ):
                 continue
+            # Inverse: when processing text model, skip vision tensors that
+            # NVFP4 packing cannot route via the LLM tensor name map.
+            if not isinstance(self, MmprojModel) and (
+                name.startswith("model.visual")
+                or name.startswith("visual.")
+                or "vision_tower" in name
+                or "vision_model" in name
+            ):
+                continue
             scale_name = name.replace(".weight", ".weight_scale")
             scale2_name = name.replace(".weight", ".weight_scale_2")
             input_scale_name = name.replace(".weight", ".input_scale")
