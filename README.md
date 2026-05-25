@@ -1,5 +1,42 @@
 # llama.cpp-dgx
 
+> ## ⚠️ DEPRECATED — use upstream `ggml-org/llama.cpp` instead
+>
+> **Status:** As of 2026-05-25, upstream llama.cpp has surpassed this fork for our target workload (Qwopus3.6-27B + NVFP4 + speculative decode on GB10 / SM 12.1).
+>
+> ### Why upstream now wins
+>
+> 1. **Native MTP speculative decode** (`--spec-type draft-mtp`, PR [#22673](https://github.com/ggml-org/llama.cpp/pull/22673) + #23269 + #23461). Co-trained drafter delivers 45-85% acceptance vs 13-20% with our DFlash + post-hoc drafter.
+> 2. **NVFP4 + MTP scale tensors** ([#23563](https://github.com/ggml-org/llama.cpp/pull/23563), 2026-05-23). Closes the last gap that forced us to fork.
+> 3. **Stable VRAM footprint**. v5 + DFlash leaks ~2-3 GB/hour into the draft KV pool (positions are written every tree step but never compacted), reaching OOM in days under sustained traffic. Upstream pre-allocates and reuses cleanly: 30 GB GPU compute pool stays flat over hours.
+> 4. **Lower system memory**. Upstream: ~44-67 GB total system used (with cache-ram 16 GB lazy-filled and reclaimable). v5: 60-78 GB and growing.
+> 5. **Practical decode parity**. Stock + MTP (n_max=5) sustains 13-26 t/s on Qwopus3.6-27B-Abl-NVFP4; v5 + DFlash sustains 11-15 t/s and degrades on long-context multi-slot.
+>
+> ### Where this fork is still useful
+>
+> - **TurboQuant (TQ3_0 / TQ3_4S) KV cache and weights** — upstream does not expose `tq3_0` as a `--cache-type-v` value yet. If you need ~12% extra KV bandwidth savings on a memory-bound decode, this fork keeps the kernels (`ggml/src/ggml-cuda/tq3-prefill.cuh`, `fattn-vec-instance-tq3_*`).
+> - **DFlash external drafter integration** (`--dflash` + `--dflash-draft`) — relevant only if you have a target architecture without MTP layers and a separately trained DFlash drafter that matches it.
+> - **Spiritbuun KV cache fixes** and the GDN chunked kernel tuned for 99 KB SM 12.1 shared memory budget — both already merged or being merged upstream; this fork carries the original variants for archival reference.
+>
+> ### Migration
+>
+> ```bash
+> # Drop-in replacement
+> git clone https://github.com/ggml-org/llama.cpp ~/llama-cpp-stock
+> cd ~/llama-cpp-stock
+> cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="120;121" -DGGML_CUDA_FA_ALL_QUANTS=ON
+> cmake --build build --target llama-server llama-quantize llama-cli -j$(nproc)
+>
+> # Replace --dflash --dflash-draft ... with:
+> --spec-type draft-mtp
+> ```
+>
+> See [croll83/jarvis/infrastructure/gb10/](https://github.com/croll83/jarvis/tree/main/infrastructure/gb10) for the consolidated GB10 deployment (systemd service + cmdline).
+>
+> ---
+
+
+
 > **Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for NVIDIA DGX Spark / GB10 (Blackwell, SM 12.1).**
 
 [![Upstream](https://img.shields.io/badge/upstream-ggml--org%2Fllama.cpp-blue)](https://github.com/ggml-org/llama.cpp)
